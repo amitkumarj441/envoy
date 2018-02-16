@@ -28,9 +28,17 @@ public:
    * Global initializer for all integration tests.
    */
   void SetUp() override {
-    fake_upstreams_.emplace_back(new FakeUpstream(0, FakeHttpConnection::Type::HTTP2, version_));
-    registerPort("upstream_0", fake_upstreams_.back()->localAddress()->ip()->port());
-    createTestServer("test/config/integration/server_grpc_json_transcoder.json", {"http"});
+    setUpstreamProtocol(FakeHttpConnection::Type::HTTP2);
+    const std::string filter =
+        R"EOF(
+            name: envoy.grpc_json_transcoder
+            config:
+              proto_descriptor : "{}"
+              services : "bookstore.Bookstore"
+            )EOF";
+    config_helper_.addFilter(
+        fmt::format(filter, TestEnvironment::runfilesPath("/test/proto/bookstore.descriptor")));
+    HttpIntegrationTest::initialize();
   }
 
   /**
@@ -47,7 +55,7 @@ protected:
                        const std::vector<std::string>& grpc_request_messages,
                        const std::vector<std::string>& grpc_response_messages,
                        const Status& grpc_status, Http::HeaderMap&& response_headers,
-                       const std::string& response_body) {
+                       const std::string& response_body, bool full_response = true) {
     response_.reset(new IntegrationStreamDecoder(*dispatcher_));
 
     codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -61,7 +69,7 @@ protected:
     }
 
     fake_upstream_connection_ = fake_upstreams_[0]->waitForHttpConnection(*dispatcher_);
-    upstream_request_ = fake_upstream_connection_->waitForNewStream();
+    upstream_request_ = fake_upstream_connection_->waitForNewStream(*dispatcher_);
     if (!grpc_request_messages.empty()) {
       upstream_request_->waitForEndStream(*dispatcher_);
 
@@ -110,14 +118,19 @@ protected:
     response_->waitForEndStream();
     EXPECT_TRUE(response_->complete());
     response_headers.iterate(
-        [](const Http::HeaderEntry& entry, void* context) -> void {
+        [](const Http::HeaderEntry& entry, void* context) -> Http::HeaderMap::Iterate {
           IntegrationStreamDecoder* response = static_cast<IntegrationStreamDecoder*>(context);
           Http::LowerCaseString lower_key{entry.key().c_str()};
           EXPECT_STREQ(entry.value().c_str(), response->headers().get(lower_key)->value().c_str());
+          return Http::HeaderMap::Iterate::Continue;
         },
         response_.get());
     if (!response_body.empty()) {
-      EXPECT_EQ(response_body, response_->body());
+      if (full_response) {
+        EXPECT_EQ(response_body, response_->body());
+      } else {
+        EXPECT_TRUE(StringUtil::startsWith(response_->body().c_str(), response_body));
+      }
     }
 
     codec_client_->close();
@@ -162,7 +175,7 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, UnaryGetError) {
           {":method", "GET"}, {":path", "/shelves/100?"}, {":authority", "host"}},
       "", {"shelf: 100"}, {}, Status(Code::NOT_FOUND, "Shelf 100 Not Found"),
       Http::TestHeaderMapImpl{
-          {":status", "200"}, {"grpc-status", "5"}, {"grpc-message", "Shelf 100 Not Found"}},
+          {":status", "404"}, {"grpc-status", "5"}, {"grpc-message", "Shelf 100 Not Found"}},
       "");
 }
 
@@ -264,13 +277,17 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, StreamingPost) {
 }
 
 TEST_P(GrpcJsonTranscoderIntegrationTest, InvalidJson) {
+  // Usually the response would be
+  // "Unexpected token.\n"
+  //    "INVALID_JSON\n"
+  //    "^"
+  // If Envoy does a short read of the upstream connection, it may only read part of the
+  // string "INVALID_JSON". Envoy will note "Unexpected token [whatever substring is read]
   testTranscoding<bookstore::CreateShelfRequest, bookstore::Shelf>(
       Http::TestHeaderMapImpl{{":method", "POST"}, {":path", "/shelf"}, {":authority", "host"}},
       R"(INVALID_JSON)", {}, {}, Status(),
       Http::TestHeaderMapImpl{{":status", "400"}, {"content-type", "text/plain"}},
-      "Unexpected token.\n"
-      "INVALID_JSON\n"
-      "^");
+      "Unexpected token.\nI", false);
 
   testTranscoding<bookstore::CreateShelfRequest, bookstore::Shelf>(
       Http::TestHeaderMapImpl{{":method", "POST"}, {":path", "/shelf"}, {":authority", "host"}},
@@ -280,13 +297,17 @@ TEST_P(GrpcJsonTranscoderIntegrationTest, InvalidJson) {
       "\n"
       "^");
 
+  // Usually the response would be
+  //    "Expected : between key:value pair.\n"
+  //    "{ \"theme\"  \"Children\" }\n"
+  //    "           ^");
+  // But as with INVALID_JSON Envoy may not read the full string from the upstream connection so may
+  // generate its error based on a partial upstream response.
   testTranscoding<bookstore::CreateShelfRequest, bookstore::Shelf>(
       Http::TestHeaderMapImpl{{":method", "POST"}, {":path", "/shelf"}, {":authority", "host"}},
       R"({ "theme"  "Children" })", {}, {}, Status(),
       Http::TestHeaderMapImpl{{":status", "400"}, {"content-type", "text/plain"}},
-      "Expected : between key:value pair.\n"
-      "{ \"theme\"  \"Children\" }\n"
-      "           ^");
+      "Expected : between key:value pair.\n", false);
 }
 
 } // namespace Envoy

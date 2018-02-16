@@ -5,11 +5,14 @@
 
 #include "envoy/common/exception.h"
 
-#include "fmt/format.h"
-#include "fmt/ostream.h"
+#include "common/common/assert.h"
+#include "common/common/fmt.h"
 
 namespace Envoy {
 namespace Registry {
+
+// Forward declaration of test class for friend declaration below.
+template <typename T> class InjectFactory;
 
 /**
  * General registry for implementation factories. The registry is templated by the Base class that a
@@ -36,7 +39,7 @@ public:
   }
 
   /**
-   * Gets a factory by name.  If the name isn't found in the registry, returns nullptr.
+   * Gets a factory by name. If the name isn't found in the registry, returns nullptr.
    */
   static Base* getFactory(const std::string& name) {
     auto it = factories().find(name);
@@ -47,6 +50,29 @@ public:
   }
 
 private:
+  // Allow factory injection only in tests.
+  friend class InjectFactory<Base>;
+
+  /**
+   * Replaces a factory by name. This method should only be used for testing purposes.
+   * @param factory is the factory to inject.
+   * @return Base* a pointer to the previously registered value.
+   */
+  static Base* replaceFactoryForTest(Base& factory) {
+    auto displaced = getFactory(factory.name());
+    factories().emplace(std::make_pair(factory.name(), &factory));
+    return displaced;
+  }
+
+  /**
+   * Remove a factory by name. This method should only be used for testing purposes.
+   * @param name is the name of the factory to remove.
+   */
+  static void removeFactoryForTest(const std::string& name) {
+    auto result = factories().erase(name);
+    RELEASE_ASSERT(result == 1);
+  }
+
   /**
    * Gets the current map of factory implementations.
    */
@@ -73,10 +99,10 @@ public:
   /**
    * Contructor that registers an instance of the factory with the FactoryRegistry.
    */
-  RegisterFactory() {
-    static T* instance = new T;
-    FactoryRegistry<Base>::registerFactory(*instance);
-  }
+  RegisterFactory() { FactoryRegistry<Base>::registerFactory(instance_); }
+
+private:
+  T instance_{};
 };
 
 } // namespace Registry

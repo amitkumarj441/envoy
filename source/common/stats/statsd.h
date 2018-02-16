@@ -22,18 +22,15 @@ namespace Statsd {
 class Writer : public ThreadLocal::ThreadLocalObject {
 public:
   Writer(Network::Address::InstanceConstSharedPtr address);
-  ~Writer();
+  // For testing.
+  Writer() : fd_(-1) {}
+  virtual ~Writer();
 
-  void writeCounter(const std::string& name, uint64_t increment);
-  void writeGauge(const std::string& name, uint64_t value);
-  void writeTimer(const std::string& name, const std::chrono::milliseconds& ms);
-
+  virtual void write(const std::string& message);
   // Called in unit test to validate address.
   int getFdForTests() const { return fd_; };
 
 private:
-  void send(const std::string& message);
-
   int fd_;
 };
 
@@ -42,24 +39,34 @@ private:
  */
 class UdpStatsdSink : public Sink {
 public:
-  UdpStatsdSink(ThreadLocal::SlotAllocator& tls, Network::Address::InstanceConstSharedPtr address);
+  UdpStatsdSink(ThreadLocal::SlotAllocator& tls, Network::Address::InstanceConstSharedPtr address,
+                const bool use_tag);
+  // For testing.
+  UdpStatsdSink(ThreadLocal::SlotAllocator& tls, const std::shared_ptr<Writer>& writer,
+                const bool use_tag)
+      : tls_(tls.allocateSlot()), use_tag_(use_tag) {
+    tls_->set(
+        [writer](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr { return writer; });
+  }
 
   // Stats::Sink
   void beginFlush() override {}
-  void flushCounter(const std::string& name, uint64_t delta) override;
-  void flushGauge(const std::string& name, uint64_t value) override;
+  void flushCounter(const Counter& counter, uint64_t delta) override;
+  void flushGauge(const Gauge& gauge, uint64_t value) override;
   void endFlush() override {}
-  void onHistogramComplete(const std::string& name, uint64_t value) override {
-    // For statsd histograms are just timers.
-    onTimespanComplete(name, std::chrono::milliseconds(value));
-  }
-  void onTimespanComplete(const std::string& name, std::chrono::milliseconds ms) override;
+  void onHistogramComplete(const Histogram& histogram, uint64_t value) override;
+
   // Called in unit test to validate writer construction and address.
   int getFdForTests() { return tls_->getTyped<Writer>().getFdForTests(); }
+  bool getUseTagForTest() { return use_tag_; }
 
 private:
+  const std::string getName(const Metric& metric);
+  const std::string buildTagStr(const std::vector<Tag>& tags);
+
   ThreadLocal::SlotPtr tls_;
   Network::Address::InstanceConstSharedPtr server_address_;
+  const bool use_tag_;
 };
 
 /**
@@ -74,23 +81,20 @@ public:
   // Stats::Sink
   void beginFlush() override { tls_->getTyped<TlsSink>().beginFlush(true); }
 
-  void flushCounter(const std::string& name, uint64_t delta) override {
-    tls_->getTyped<TlsSink>().flushCounter(name, delta);
+  void flushCounter(const Counter& counter, uint64_t delta) override {
+    tls_->getTyped<TlsSink>().flushCounter(counter.name(), delta);
   }
 
-  void flushGauge(const std::string& name, uint64_t value) override {
-    tls_->getTyped<TlsSink>().flushGauge(name, value);
+  void flushGauge(const Gauge& gauge, uint64_t value) override {
+    tls_->getTyped<TlsSink>().flushGauge(gauge.name(), value);
   }
 
   void endFlush() override { tls_->getTyped<TlsSink>().endFlush(true); }
 
-  void onHistogramComplete(const std::string& name, uint64_t value) override {
-    // For statsd histograms are just timers.
-    onTimespanComplete(name, std::chrono::milliseconds(value));
-  }
-
-  void onTimespanComplete(const std::string& name, std::chrono::milliseconds ms) override {
-    tls_->getTyped<TlsSink>().onTimespanComplete(name, ms);
+  void onHistogramComplete(const Histogram& histogram, uint64_t value) override {
+    // For statsd histograms are all timers.
+    tls_->getTyped<TlsSink>().onTimespanComplete(histogram.name(),
+                                                 std::chrono::milliseconds(value));
   }
 
 private:

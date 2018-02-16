@@ -29,16 +29,15 @@ void SslIntegrationTest::initialize() {
   context_manager_.reset(new ContextManagerImpl(*runtime_));
 
   registerTestServerPorts({"http"});
-  client_ssl_ctx_plain_ = createClientSslContext(false, false, *context_manager_);
-  client_ssl_ctx_alpn_ = createClientSslContext(true, false, *context_manager_);
-  client_ssl_ctx_san_ = createClientSslContext(false, true, *context_manager_);
-  client_ssl_ctx_alpn_san_ = createClientSslContext(true, true, *context_manager_);
+  client_ssl_ctx_plain_ = createClientSslTransportSocketFactory(false, false, *context_manager_);
+  client_ssl_ctx_alpn_ = createClientSslTransportSocketFactory(true, false, *context_manager_);
+  client_ssl_ctx_san_ = createClientSslTransportSocketFactory(false, true, *context_manager_);
+  client_ssl_ctx_alpn_san_ = createClientSslTransportSocketFactory(true, true, *context_manager_);
 }
 
 void SslIntegrationTest::TearDown() {
   test_server_.reset();
   fake_upstreams_.clear();
-  upstream_ssl_ctx_.reset();
   client_ssl_ctx_plain_.reset();
   client_ssl_ctx_alpn_.reset();
   client_ssl_ctx_san_.reset();
@@ -47,30 +46,19 @@ void SslIntegrationTest::TearDown() {
   runtime_.reset();
 }
 
-ServerContextPtr SslIntegrationTest::createUpstreamSslContext() {
-  static auto* upstream_stats_store = new Stats::TestIsolatedStoreImpl();
-  std::string json = R"EOF(
-{
-  "cert_chain_file": "{{ test_rundir }}/test/config/integration/certs/upstreamcert.pem",
-  "private_key_file": "{{ test_rundir }}/test/config/integration/certs/upstreamkey.pem"
-}
-)EOF";
-
-  Json::ObjectSharedPtr loader = TestEnvironment::jsonLoadFromString(json);
-  ServerContextConfigImpl cfg(*loader);
-  return context_manager_->createSslServerContext(*upstream_stats_store, cfg);
-}
-
 Network::ClientConnectionPtr SslIntegrationTest::makeSslClientConnection(bool alpn, bool san) {
   Network::Address::InstanceConstSharedPtr address = getSslAddress(version_, lookupPort("http"));
   if (alpn) {
-    return dispatcher_->createSslClientConnection(
-        san ? *client_ssl_ctx_alpn_san_ : *client_ssl_ctx_alpn_, address,
-        Network::Address::InstanceConstSharedPtr());
+    return dispatcher_->createClientConnection(
+        address, Network::Address::InstanceConstSharedPtr(),
+        san ? client_ssl_ctx_alpn_san_->createTransportSocket()
+            : client_ssl_ctx_alpn_->createTransportSocket(),
+        nullptr);
   } else {
-    return dispatcher_->createSslClientConnection(
-        san ? *client_ssl_ctx_san_ : *client_ssl_ctx_plain_, address,
-        Network::Address::InstanceConstSharedPtr());
+    return dispatcher_->createClientConnection(address, Network::Address::InstanceConstSharedPtr(),
+                                               san ? client_ssl_ctx_san_->createTransportSocket()
+                                                   : client_ssl_ctx_plain_->createTransportSocket(),
+                                               nullptr);
   }
 }
 
@@ -108,6 +96,8 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBuffer) {
 
 TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferHttp2) {
   setDownstreamProtocol(Http::CodecClient::Type::HTTP2);
+  config_helper_.setClientCodec(
+      envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager::AUTO);
   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
     return makeSslClientConnection(true, false);
   };
@@ -115,7 +105,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferHttp2) {
   checkStats();
 }
 
-TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferVierfySAN) {
+TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferVerifySAN) {
   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
     return makeSslClientConnection(false, true);
   };
@@ -176,7 +166,7 @@ TEST_P(SslIntegrationTest, AdminCertEndpoint) {
 TEST_P(SslIntegrationTest, AltAlpn) {
   // Write the runtime file to turn alt_alpn on.
   TestEnvironment::writeStringToFileForTest("runtime/ssl.alt_alpn", "100");
-  config_helper_.addConfigModifier([&](envoy::api::v2::Bootstrap& bootstrap) -> void {
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v2::Bootstrap& bootstrap) -> void {
     // Configure the runtime directory.
     bootstrap.mutable_runtime()->set_symlink_root(TestEnvironment::temporaryPath("runtime"));
   });

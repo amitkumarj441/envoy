@@ -8,13 +8,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "envoy/config/filter/network/redis_proxy/v2/redis_proxy.pb.h"
 #include "envoy/redis/conn_pool.h"
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/buffer/buffer_impl.h"
-#include "common/json/json_validator.h"
 #include "common/network/filter_impl.h"
+#include "common/protobuf/utility.h"
 #include "common/redis/codec_impl.h"
 
 namespace Envoy {
@@ -22,11 +23,14 @@ namespace Redis {
 namespace ConnPool {
 
 // TODO(mattklein123): Circuit breaking
+// TODO(rshriram): Fault injection
 
-class ConfigImpl : public Config, Json::Validator {
+class ConfigImpl : public Config {
 public:
-  ConfigImpl(const Json::Object& config);
+  ConfigImpl(
+      const envoy::config::filter::network::redis_proxy::v2::RedisProxy::ConnPoolSettings& config);
 
+  bool disableOutlierEvents() const override { return false; }
   std::chrono::milliseconds opTimeout() const override { return op_timeout_; }
 
 private:
@@ -53,7 +57,7 @@ private:
     UpstreamReadFilter(ClientImpl& parent) : parent_(parent) {}
 
     // Network::ReadFilter
-    Network::FilterStatus onData(Buffer::Instance& data) override {
+    Network::FilterStatus onData(Buffer::Instance& data, bool) override {
       parent_.onData(data);
       return Network::FilterStatus::Continue;
     }
@@ -77,6 +81,7 @@ private:
              DecoderFactory& decoder_factory, const Config& config);
   void onConnectOrOpTimeout();
   void onData(Buffer::Instance& data);
+  void putOutlierEvent(Upstream::Outlier::Result result);
 
   // Redis::DecoderCallbacks
   void onRespValue(RespValuePtr&& value) override;
@@ -111,9 +116,10 @@ private:
 
 class InstanceImpl : public Instance {
 public:
-  InstanceImpl(const std::string& cluster_name, Upstream::ClusterManager& cm,
-               ClientFactory& client_factory, ThreadLocal::SlotAllocator& tls,
-               const Json::Object& config);
+  InstanceImpl(
+      const std::string& cluster_name, Upstream::ClusterManager& cm, ClientFactory& client_factory,
+      ThreadLocal::SlotAllocator& tls,
+      const envoy::config::filter::network::redis_proxy::v2::RedisProxy::ConnPoolSettings& config);
 
   // Redis::ConnPool::Instance
   PoolRequest* makeRequest(const std::string& hash_key, const RespValue& request,
@@ -156,7 +162,8 @@ private:
     LbContextImpl(const std::string& hash_key) : hash_key_(std::hash<std::string>()(hash_key)) {}
     // TODO(danielhochman): convert to HashUtil::xxHash64 when we have a migration strategy.
     // Upstream::LoadBalancerContext
-    Optional<uint64_t> hashKey() const override { return hash_key_; }
+    Optional<uint64_t> computeHashKey() override { return hash_key_; }
+    const Router::MetadataMatchCriteria* metadataMatchCriteria() const override { return nullptr; }
     const Network::Connection* downstreamConnection() const override { return nullptr; }
 
     const Optional<uint64_t> hash_key_;

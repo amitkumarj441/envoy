@@ -29,7 +29,8 @@ class CdsApiImplTest : public testing::Test {
 public:
   CdsApiImplTest() : request_(&cm_.async_client_) {}
 
-  void setup() {
+  void setup(bool v2_rest = false) {
+    v2_rest_ = v2_rest;
     const std::string config_json = R"EOF(
     {
       "cluster": {
@@ -39,8 +40,20 @@ public:
     )EOF";
 
     Json::ObjectSharedPtr config = Json::Factory::loadFromString(config_json);
-    envoy::api::v2::ConfigSource cds_config;
+    envoy::api::v2::core::ConfigSource cds_config;
     Config::Utility::translateCdsConfig(*config, cds_config);
+    if (v2_rest) {
+      cds_config.mutable_api_config_source()->set_api_type(
+          envoy::api::v2::core::ApiConfigSource::REST);
+    }
+    Upstream::ClusterManager::ClusterInfoMap cluster_map;
+    Upstream::MockCluster cluster;
+    cluster_map.emplace("foo_cluster", cluster);
+    EXPECT_CALL(cm_, clusters()).WillOnce(Return(cluster_map));
+    EXPECT_CALL(cluster, info());
+    EXPECT_CALL(*cluster.info_, addedViaApi());
+    EXPECT_CALL(cluster, info());
+    EXPECT_CALL(*cluster.info_, type());
     cds_ =
         CdsApiImpl::create(cds_config, eds_config_, cm_, dispatcher_, random_, local_info_, store_);
     cds_->setInitializedCb([this]() -> void { initialized_.ready(); });
@@ -63,9 +76,11 @@ public:
         .WillOnce(
             Invoke([&](Http::MessagePtr& request, Http::AsyncClient::Callbacks& callbacks,
                        const Optional<std::chrono::milliseconds>&) -> Http::AsyncClient::Request* {
-              EXPECT_EQ((Http::TestHeaderMapImpl{{":method", "GET"},
-                                                 {":path", "/v1/clusters/cluster_name/node_name"},
-                                                 {":authority", "foo_cluster"}}),
+              EXPECT_EQ((Http::TestHeaderMapImpl{
+                            {":method", v2_rest_ ? "POST" : "GET"},
+                            {":path", v2_rest_ ? "/v2/discovery:clusters"
+                                               : "/v1/clusters/cluster_name/node_name"},
+                            {":authority", "foo_cluster"}}),
                         request->headers());
               callbacks_ = &callbacks;
               return &request_;
@@ -80,8 +95,9 @@ public:
     return map;
   }
 
-  MockClusterManager cm_;
-  Event::MockDispatcher dispatcher_;
+  bool v2_rest_{};
+  NiceMock<MockClusterManager> cm_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
   NiceMock<Runtime::MockRandomGenerator> random_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
   Stats::IsolatedStoreImpl store_;
@@ -90,8 +106,22 @@ public:
   Event::MockTimer* interval_timer_;
   Http::AsyncClient::Callbacks* callbacks_{};
   ReadyWatcher initialized_;
-  Optional<envoy::api::v2::ConfigSource> eds_config_;
+  Optional<envoy::api::v2::core::ConfigSource> eds_config_;
 };
+
+// Negative test for protoc-gen-validate constraints.
+TEST_F(CdsApiImplTest, ValidateFail) {
+  InSequence s;
+
+  setup(true);
+
+  Protobuf::RepeatedPtrField<envoy::api::v2::Cluster> clusters;
+  clusters.Add();
+
+  EXPECT_THROW(dynamic_cast<CdsApiImpl*>(cds_.get())->onConfigUpdate(clusters),
+               ProtoValidationException);
+  EXPECT_CALL(request_, cancel());
+}
 
 TEST_F(CdsApiImplTest, InvalidOptions) {
   const std::string config_json = R"EOF(
@@ -103,9 +133,9 @@ TEST_F(CdsApiImplTest, InvalidOptions) {
   )EOF";
 
   Json::ObjectSharedPtr config = Json::Factory::loadFromString(config_json);
-  local_info_.cluster_name_ = "";
-  local_info_.node_name_ = "";
-  envoy::api::v2::ConfigSource cds_config;
+  local_info_.node_.set_cluster("");
+  local_info_.node_.set_id("");
+  envoy::api::v2::core::ConfigSource cds_config;
   Config::Utility::translateCdsConfig(*config, cds_config);
   EXPECT_THROW(
       CdsApiImpl::create(cds_config, eds_config_, cm_, dispatcher_, random_, local_info_, store_),
@@ -132,8 +162,10 @@ TEST_F(CdsApiImplTest, Basic) {
   EXPECT_CALL(initialized_, ready());
   EXPECT_CALL(*interval_timer_, enableTimer(_));
   EXPECT_EQ("", cds_->versionInfo());
+  EXPECT_EQ(0UL, store_.gauge("cluster_manager.cds.version").value());
   callbacks_->onSuccess(std::move(message));
-  EXPECT_EQ(Config::Utility::computeHashedVersion(response1_json), cds_->versionInfo());
+  EXPECT_EQ(Config::Utility::computeHashedVersion(response1_json).first, cds_->versionInfo());
+  EXPECT_EQ(4054905652974790809U, store_.gauge("cluster_manager.cds.version").value());
 
   expectRequest();
   interval_timer_->callback_();
@@ -155,7 +187,8 @@ TEST_F(CdsApiImplTest, Basic) {
 
   EXPECT_EQ(2UL, store_.counter("cluster_manager.cds.update_attempt").value());
   EXPECT_EQ(2UL, store_.counter("cluster_manager.cds.update_success").value());
-  EXPECT_EQ(Config::Utility::computeHashedVersion(response2_json), cds_->versionInfo());
+  EXPECT_EQ(Config::Utility::computeHashedVersion(response2_json).first, cds_->versionInfo());
+  EXPECT_EQ(1872764556139482420U, store_.gauge("cluster_manager.cds.version").value());
 }
 
 TEST_F(CdsApiImplTest, Failure) {
@@ -187,6 +220,7 @@ TEST_F(CdsApiImplTest, Failure) {
   EXPECT_EQ("", cds_->versionInfo());
   EXPECT_EQ(2UL, store_.counter("cluster_manager.cds.update_attempt").value());
   EXPECT_EQ(2UL, store_.counter("cluster_manager.cds.update_failure").value());
+  EXPECT_EQ(0UL, store_.gauge("cluster_manager.cds.version").value());
 }
 
 TEST_F(CdsApiImplTest, FailureArray) {
@@ -210,6 +244,7 @@ TEST_F(CdsApiImplTest, FailureArray) {
   EXPECT_EQ("", cds_->versionInfo());
   EXPECT_EQ(1UL, store_.counter("cluster_manager.cds.update_attempt").value());
   EXPECT_EQ(1UL, store_.counter("cluster_manager.cds.update_failure").value());
+  EXPECT_EQ(0UL, store_.gauge("cluster_manager.cds.version").value());
 }
 
 } // namespace Upstream

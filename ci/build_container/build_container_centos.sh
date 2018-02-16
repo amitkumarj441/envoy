@@ -1,17 +1,19 @@
 #!/bin/bash -e
 
-# scl devtoolset repository
-yum install -y centos-release-scl
+# scl devtoolset and epel repositories
+yum install -y centos-release-scl epel-release
 
 # llvm-5.0.0 repository from copr
 curl -L -o /etc/yum.repos.d/alonid-llvm-5.0.0-epel-7.repo \
   https://copr.fedorainfracloud.org/coprs/alonid/llvm-5.0.0/repo/epel-7/alonid-llvm-5.0.0-epel-7.repo
 
 # dependencies for bazel and build_recipes
-yum install -y java-1.8.0-openjdk-devel unzip which \
-               cmake devtoolset-4-gcc-c++ git golang libtool make patch rsync wget \
+yum install -y java-1.8.0-openjdk-devel unzip which openssl rpm-build \
+               cmake3 devtoolset-4-gcc-c++ git golang libtool make patch rsync wget \
                clang-5.0.0 devtoolset-4-libatomic-devel llvm-5.0.0 python-virtualenv
 yum clean all
+
+ln -s /usr/bin/cmake3 /usr/bin/cmake
 
 # latest bazel installer
 BAZEL_VERSION="$(curl -s https://api.github.com/repos/bazelbuild/bazel/releases/latest |
@@ -44,6 +46,3 @@ set +e
 set -e
 
 EXPECTED_CXX_VERSION="g++ (GCC) 5.3.1 20160406 (Red Hat 5.3.1-6)" ./build_container_common.sh
-
-# googletest install to lib64
-cp -a /thirdparty_build/lib64/* /thirdparty_build/lib

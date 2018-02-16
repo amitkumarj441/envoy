@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 
 #include "envoy/buffer/buffer.h"
@@ -19,6 +20,12 @@ class Stream;
 class StreamEncoder {
 public:
   virtual ~StreamEncoder() {}
+
+  /**
+   * Encode 100-Continue headers.
+   * @param headers supplies the 100-Continue header map to encode.
+   */
+  virtual void encode100ContinueHeaders(const HeaderMap& headers) PURE;
 
   /**
    * Encode headers, optionally indicating end of stream.
@@ -52,6 +59,12 @@ public:
 class StreamDecoder {
 public:
   virtual ~StreamDecoder() {}
+
+  /**
+   * Called with decoded 100-Continue headers.
+   * @param headers supplies the decoded 100-Continue headers map that is moved into the callee.
+   */
+  virtual void decode100ContinueHeaders(HeaderMapPtr&& headers) PURE;
 
   /**
    * Called with decoded headers, optionally indicating end of stream.
@@ -146,7 +159,7 @@ public:
 
   /**
    * Enable/disable further data from this stream.
-   * Cessation of data may not be immediate.  For example, for HTTP/2 this may stop further flow
+   * Cessation of data may not be immediate. For example, for HTTP/2 this may stop further flow
    * control window updates which will result in the peer eventually stopping sending data.
    * @param disable informs if reads should be disabled (true) or re-enabled (false).
    */
@@ -197,7 +210,7 @@ struct Http2Settings {
   // initial value from HTTP/2 spec, same as NGHTTP2_DEFAULT_HEADER_TABLE_SIZE from nghttp2
   static const uint32_t DEFAULT_HPACK_TABLE_SIZE = (1 << 12);
   // no maximum from HTTP/2 spec, use unsigned 32-bit maximum
-  static const uint32_t MAX_HPACK_TABLE_SIZE = (1UL << 32) - 1;
+  static const uint32_t MAX_HPACK_TABLE_SIZE = std::numeric_limits<uint32_t>::max();
 
   // TODO(jwfang): make this 0, the HTTP/2 spec minimum
   static const uint32_t MIN_MAX_CONCURRENT_STREAMS = 1;

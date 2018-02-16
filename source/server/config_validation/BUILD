@@ -31,6 +31,7 @@ envoy_cc_library(
     srcs = ["async_client.cc"],
     hdrs = ["async_client.h"],
     deps = [
+        ":dispatcher_lib",
         "//include/envoy/http:async_client_interface",
         "//include/envoy/http:message_interface",
         "//source/common/common:assert_lib",
@@ -73,7 +74,6 @@ envoy_cc_library(
     name = "server_lib",
     srcs = ["server.cc"],
     hdrs = ["server.h"],
-    external_deps = ["envoy_bootstrap"],
     deps = [
         ":admin_lib",
         ":api_lib",
@@ -88,6 +88,7 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/common:version_lib",
         "//source/common/config:bootstrap_json_lib",
+        "//source/common/config:utility_lib",
         "//source/common/local_info:local_info_lib",
         "//source/common/protobuf:utility_lib",
         "//source/common/router:rds_lib",
@@ -98,5 +99,6 @@ envoy_cc_library(
         "//source/server:configuration_lib",
         "//source/server:server_lib",
         "//source/server/http:admin_lib",
+        "@envoy_api//envoy/config/bootstrap/v2:bootstrap_cc",
     ],
 )

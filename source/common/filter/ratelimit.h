@@ -5,13 +5,12 @@
 #include <string>
 #include <vector>
 
+#include "envoy/config/filter/network/rate_limit/v2/rate_limit.pb.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/filter.h"
 #include "envoy/ratelimit/ratelimit.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats_macros.h"
-
-#include "common/json/json_loader.h"
 
 namespace Envoy {
 namespace RateLimit {
@@ -42,7 +41,8 @@ struct InstanceStats {
  */
 class Config {
 public:
-  Config(const Json::Object& config, Stats::Scope& scope, Runtime::Loader& runtime);
+  Config(const envoy::config::filter::network::rate_limit::v2::RateLimit& config,
+         Stats::Scope& scope, Runtime::Loader& runtime);
   const std::string& domain() { return domain_; }
   const std::vector<Descriptor>& descriptors() { return descriptors_; }
   Runtime::Loader& runtime() { return runtime_; }
@@ -73,7 +73,7 @@ public:
       : config_(config), client_(std::move(client)) {}
 
   // Network::ReadFilter
-  Network::FilterStatus onData(Buffer::Instance& data) override;
+  Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override {
     filter_callbacks_ = &callbacks;

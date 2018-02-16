@@ -25,7 +25,7 @@
 #include "common/network/address_impl.h"
 #include "common/protobuf/protobuf.h"
 
-#include "fmt/format.h"
+#include "common/common/fmt.h"
 
 namespace Envoy {
 namespace Network {
@@ -34,9 +34,9 @@ const std::string Utility::TCP_SCHEME = "tcp://";
 const std::string Utility::UNIX_SCHEME = "unix://";
 
 Address::InstanceConstSharedPtr Utility::resolveUrl(const std::string& url) {
-  if (url.find(TCP_SCHEME) == 0) {
+  if (urlIsTcpScheme(url)) {
     return parseInternetAddressAndPort(url.substr(TCP_SCHEME.size()));
-  } else if (url.find(UNIX_SCHEME) == 0) {
+  } else if (urlIsUnixScheme(url)) {
     return Address::InstanceConstSharedPtr{
         new Address::PipeInstance(url.substr(UNIX_SCHEME.size()))};
   } else {
@@ -44,9 +44,13 @@ Address::InstanceConstSharedPtr Utility::resolveUrl(const std::string& url) {
   }
 }
 
+bool Utility::urlIsTcpScheme(const std::string& url) { return url.find(TCP_SCHEME) == 0; }
+
+bool Utility::urlIsUnixScheme(const std::string& url) { return url.find(UNIX_SCHEME) == 0; }
+
 std::string Utility::hostFromTcpUrl(const std::string& url) {
-  if (url.find(TCP_SCHEME) != 0) {
-    throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
+  if (!urlIsTcpScheme(url)) {
+    throw EnvoyException(fmt::format("expected TCP scheme, got: {}", url));
   }
 
   size_t colon_index = url.find(':', TCP_SCHEME.size());
@@ -59,8 +63,8 @@ std::string Utility::hostFromTcpUrl(const std::string& url) {
 }
 
 uint32_t Utility::portFromTcpUrl(const std::string& url) {
-  if (url.find(TCP_SCHEME) != 0) {
-    throw EnvoyException(fmt::format("unknown protocol scheme: {}", url));
+  if (!urlIsTcpScheme(url)) {
+    throw EnvoyException(fmt::format("expected TCP scheme, got: {}", url));
   }
 
   size_t colon_index = url.find(':', TCP_SCHEME.size());
@@ -77,7 +81,7 @@ uint32_t Utility::portFromTcpUrl(const std::string& url) {
 }
 
 Address::InstanceConstSharedPtr Utility::parseInternetAddress(const std::string& ip_address,
-                                                              uint16_t port) {
+                                                              uint16_t port, bool v6only) {
   sockaddr_in sa4;
   if (inet_pton(AF_INET, ip_address.c_str(), &sa4.sin_addr) == 1) {
     sa4.sin_family = AF_INET;
@@ -85,17 +89,18 @@ Address::InstanceConstSharedPtr Utility::parseInternetAddress(const std::string&
     return std::make_shared<Address::Ipv4Instance>(&sa4);
   }
   sockaddr_in6 sa6;
+  memset(&sa6, 0, sizeof(sa6));
   if (inet_pton(AF_INET6, ip_address.c_str(), &sa6.sin6_addr) == 1) {
     sa6.sin6_family = AF_INET6;
     sa6.sin6_port = htons(port);
-    return std::make_shared<Address::Ipv6Instance>(sa6);
+    return std::make_shared<Address::Ipv6Instance>(sa6, v6only);
   }
   throwWithMalformedIp(ip_address);
   NOT_REACHED;
 }
 
-Address::InstanceConstSharedPtr
-Utility::parseInternetAddressAndPort(const std::string& ip_address) {
+Address::InstanceConstSharedPtr Utility::parseInternetAddressAndPort(const std::string& ip_address,
+                                                                     bool v6only) {
   if (ip_address.empty()) {
     throwWithMalformedIp(ip_address);
   }
@@ -112,12 +117,13 @@ Utility::parseInternetAddressAndPort(const std::string& ip_address) {
       throwWithMalformedIp(ip_address);
     }
     sockaddr_in6 sa6;
+    memset(&sa6, 0, sizeof(sa6));
     if (ip_str.empty() || inet_pton(AF_INET6, ip_str.c_str(), &sa6.sin6_addr) != 1) {
       throwWithMalformedIp(ip_address);
     }
     sa6.sin6_family = AF_INET6;
     sa6.sin6_port = htons(port64);
-    return std::make_shared<Address::Ipv6Instance>(sa6);
+    return std::make_shared<Address::Ipv6Instance>(sa6, v6only);
   }
   // Treat it as an IPv4 address followed by a port.
   auto pos = ip_address.rfind(":");
@@ -144,25 +150,6 @@ Address::InstanceConstSharedPtr Utility::copyInternetAddressAndPort(const Addres
     return std::make_shared<Address::Ipv4Instance>(ip.addressAsString(), ip.port());
   }
   return std::make_shared<Address::Ipv6Instance>(ip.addressAsString(), ip.port());
-}
-
-Address::InstanceConstSharedPtr Utility::fromProtoAddress(const envoy::api::v2::Address& address) {
-  switch (address.address_case()) {
-  case envoy::api::v2::Address::kSocketAddress:
-    return Utility::fromProtoSocketAddress(address.socket_address());
-  case envoy::api::v2::Address::kPipe:
-    return Address::InstanceConstSharedPtr{new Address::PipeInstance(address.pipe().path())};
-  default:
-    throw EnvoyException("Address must be a socket or pipe: " + address.DebugString());
-  }
-}
-
-Address::InstanceConstSharedPtr
-Utility::fromProtoSocketAddress(const envoy::api::v2::SocketAddress& socket_address) {
-  // TODO(htuch): Support custom resolvers #1477.
-  ASSERT(socket_address.resolver_name().empty());
-  ASSERT(socket_address.named_port().empty());
-  return parseInternetAddress(socket_address.address(), socket_address.port_value());
 }
 
 void Utility::throwWithMalformedIp(const std::string& ip_address) {
@@ -215,34 +202,34 @@ Address::InstanceConstSharedPtr Utility::getLocalAddress(const Address::IpVersio
   return ret;
 }
 
-bool Utility::isInternalAddress(const char* address) {
-  // First try as an IPv4 address.
-  in_addr addr;
-  int rc = inet_pton(AF_INET, address, &addr);
-  if (rc == 1) {
+bool Utility::isInternalAddress(const Address::Instance& address) {
+  if (address.type() != Address::Type::Ip) {
+    return false;
+  }
+
+  if (address.ip()->version() == Address::IpVersion::v4) {
     // Handle the RFC1918 space for IPV4. Also count loopback as internal.
-    uint8_t* address_bytes = reinterpret_cast<uint8_t*>(&addr.s_addr);
-    if ((address_bytes[0] == 10) || (address_bytes[0] == 192 && address_bytes[1] == 168) ||
-        (address_bytes[0] == 172 && address_bytes[1] >= 16 && address_bytes[1] <= 31) ||
-        addr.s_addr == htonl(INADDR_LOOPBACK)) {
+    const uint32_t address4 = address.ip()->ipv4()->address();
+    const uint8_t* address4_bytes = reinterpret_cast<const uint8_t*>(&address4);
+    if ((address4_bytes[0] == 10) || (address4_bytes[0] == 192 && address4_bytes[1] == 168) ||
+        (address4_bytes[0] == 172 && address4_bytes[1] >= 16 && address4_bytes[1] <= 31) ||
+        address4 == htonl(INADDR_LOOPBACK)) {
       return true;
     } else {
       return false;
     }
   }
 
-  // Now try as an IPv6 address.
-  in6_addr addr6;
-  int rc6 = inet_pton(AF_INET6, address, &addr6);
-  if (rc6 == 1) {
-    // Local IPv6 address prefix defined in RFC4193. Local addresses have prefix FC00::/7.
-    // Currently, the FD00::/8 prefix is locally assigned and FC00::/8 may be defined in the
-    // future.
-    uint8_t* address6_bytes = reinterpret_cast<uint8_t*>(&addr6.s6_addr);
-    if (address6_bytes[0] == 0xfd ||
-        memcmp(address6_bytes, &in6addr_loopback, sizeof(in6addr_loopback)) == 0) {
-      return true;
-    }
+  // Local IPv6 address prefix defined in RFC4193. Local addresses have prefix FC00::/7.
+  // Currently, the FD00::/8 prefix is locally assigned and FC00::/8 may be defined in the
+  // future.
+  static_assert(sizeof(absl::uint128) == sizeof(in6addr_loopback),
+                "sizeof(absl::uint128) != sizeof(in6addr_loopback)");
+  const absl::uint128 address6 = address.ip()->ipv6()->address();
+  const uint8_t* address6_bytes = reinterpret_cast<const uint8_t*>(&address6);
+  if (address6_bytes[0] == 0xfd ||
+      memcmp(&address6, &in6addr_loopback, sizeof(in6addr_loopback)) == 0) {
+    return true;
   }
 
   return false;
@@ -257,7 +244,9 @@ bool Utility::isLoopbackAddress(const Address::Instance& address) {
     // Compare to the canonical v4 loopback address: 127.0.0.1.
     return address.ip()->ipv4()->address() == htonl(INADDR_LOOPBACK);
   } else if (address.ip()->version() == Address::IpVersion::v6) {
-    std::array<uint8_t, 16> addr = address.ip()->ipv6()->address();
+    static_assert(sizeof(absl::uint128) == sizeof(in6addr_loopback),
+                  "sizeof(absl::uint128) != sizeof(in6addr_loopback)");
+    absl::uint128 addr = address.ip()->ipv6()->address();
     return 0 == memcmp(&addr, &in6addr_loopback, sizeof(in6addr_loopback));
   }
   NOT_IMPLEMENTED;
@@ -320,14 +309,15 @@ Address::InstanceConstSharedPtr Utility::getOriginalDst(int fd) {
 #endif
 }
 
-void Utility::parsePortRangeList(const std::string& string, std::list<PortRange>& list) {
-  std::vector<std::string> ranges = StringUtil::split(string.c_str(), ',');
-  for (const std::string& s : ranges) {
-    std::stringstream ss(s);
+void Utility::parsePortRangeList(absl::string_view string, std::list<PortRange>& list) {
+  const auto ranges = StringUtil::splitToken(string, ",");
+  for (auto s : ranges) {
+    const std::string s_string{s};
+    std::stringstream ss(s_string);
     uint32_t min = 0;
     uint32_t max = 0;
 
-    if (s.find('-') != std::string::npos) {
+    if (s.find("-") != std::string::npos) {
       char dash = 0;
       ss >> min;
       ss >> dash;
@@ -338,7 +328,7 @@ void Utility::parsePortRangeList(const std::string& string, std::list<PortRange>
     }
 
     if (s.empty() || (min > 65535) || (max > 65535) || ss.fail() || !ss.eof()) {
-      throw EnvoyException(fmt::format("invalid port number or range '{}'", s));
+      throw EnvoyException(fmt::format("invalid port number or range '{}'", s_string));
     }
 
     list.emplace_back(PortRange(min, max));
@@ -356,6 +346,43 @@ bool Utility::portInRangeList(const Address::Instance& address, const std::list<
     }
   }
   return false;
+}
+
+absl::uint128 Utility::Ip6ntohl(const absl::uint128& address) {
+  // TODO(ccaraman): Support Ip6ntohl for big-endian.
+  static_assert(ABSL_IS_LITTLE_ENDIAN,
+                "Machines using big-endian byte order is not supported for IPv6.");
+  return flipOrder(address);
+}
+
+absl::uint128 Utility::Ip6htonl(const absl::uint128& address) {
+  // TODO(ccaraman): Support Ip6ntohl for big-endian.
+  static_assert(ABSL_IS_LITTLE_ENDIAN,
+                "Machines using big-endian byte order is not supported for IPv6.");
+  return flipOrder(address);
+}
+
+absl::uint128 Utility::flipOrder(const absl::uint128& input) {
+  absl::uint128 result{0};
+  absl::uint128 data = input;
+  for (int i = 0; i < 16; i++) {
+    result <<= 8;
+    result |= (data & 0x000000000000000000000000000000FF);
+    data >>= 8;
+  }
+  return result;
+}
+
+void Utility::addressToProtobufAddress(const Address::Instance& address,
+                                       envoy::api::v2::core::Address& proto_address) {
+  if (address.type() == Address::Type::Pipe) {
+    proto_address.mutable_pipe()->set_path(address.asString());
+  } else {
+    ASSERT(address.type() == Address::Type::Ip);
+    auto* socket_address = proto_address.mutable_socket_address();
+    socket_address->set_address(address.ip()->addressAsString());
+    socket_address->set_port_value(address.ip()->port());
+  }
 }
 
 } // namespace Network

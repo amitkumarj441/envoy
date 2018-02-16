@@ -1,10 +1,16 @@
 #pragma once
 
 namespace Envoy {
+
 /**
  * @return the size of a C array.
  */
 #define ARRAY_SIZE(X) (sizeof(X) / sizeof(X[0]))
+
+/**
+ * @return the length of a static string literal, e.g. STATIC_STRLEN("foo") == 3.
+ */
+#define STATIC_STRLEN(X) (sizeof(X) - 1)
 
 /**
  * Helper macros from enum to string macros.
@@ -28,11 +34,14 @@ namespace Envoy {
 /**
  * Have a generic fall-through for different versions of C++
  */
-#if __cplusplus >= 201402L // C++14, C++17 and above
+#if __cplusplus >= 201703L // C++17 and above
+#define FALLTHRU [[fallthrough]]
+#elif __cplusplus >= 201402L && __clang_major__ >= 5 // C++14 clang-5
 #define FALLTHRU [[fallthrough]]
 #elif __cplusplus >= 201103L && __GNUC__ >= 7 // C++11 gcc 7
 #define FALLTHRU [[gnu::fallthrough]]
 #else // C++11 on gcc 6, and all other cases
 #define FALLTHRU
 #endif
+
 } // Envoy

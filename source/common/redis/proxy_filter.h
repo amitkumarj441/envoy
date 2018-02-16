@@ -5,14 +5,14 @@
 #include <memory>
 #include <string>
 
+#include "envoy/config/filter/network/redis_proxy/v2/redis_proxy.pb.h"
+#include "envoy/network/drain_decision.h"
 #include "envoy/network/filter.h"
 #include "envoy/redis/codec.h"
 #include "envoy/redis/command_splitter.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/buffer/buffer_impl.h"
-#include "common/json/json_loader.h"
-#include "common/json/json_validator.h"
 
 namespace Envoy {
 namespace Redis {
@@ -29,6 +29,7 @@ namespace Redis {
   COUNTER(downstream_cx_protocol_error)                                                            \
   COUNTER(downstream_cx_total)                                                                     \
   GAUGE  (downstream_cx_active)                                                                    \
+  COUNTER(downstream_cx_drain_close)                                                               \
   COUNTER(downstream_rq_total)                                                                     \
   GAUGE  (downstream_rq_active)
 // clang-format on
@@ -43,20 +44,21 @@ struct ProxyStats {
 /**
  * Configuration for the redis proxy filter.
  */
-class ProxyFilterConfig : Json::Validator {
+class ProxyFilterConfig {
 public:
-  ProxyFilterConfig(const Json::Object& config, Upstream::ClusterManager& cm, Stats::Scope& scope);
+  ProxyFilterConfig(const envoy::config::filter::network::redis_proxy::v2::RedisProxy& config,
+                    Upstream::ClusterManager& cm, Stats::Scope& scope,
+                    const Network::DrainDecision& drain_decision, Runtime::Loader& runtime);
 
-  const std::string& clusterName() { return cluster_name_; }
-  const std::string& statPrefix() { return stat_prefix_; }
-  ProxyStats& stats() { return stats_; }
+  const Network::DrainDecision& drain_decision_;
+  Runtime::Loader& runtime_;
+  const std::string cluster_name_;
+  const std::string stat_prefix_;
+  const std::string redis_drain_close_runtime_key_{"redis.drain_close_enabled"};
+  ProxyStats stats_;
 
 private:
   static ProxyStats generateStats(const std::string& prefix, Stats::Scope& scope);
-
-  const std::string cluster_name_;
-  const std::string stat_prefix_;
-  ProxyStats stats_;
 };
 
 typedef std::shared_ptr<ProxyFilterConfig> ProxyFilterConfigSharedPtr;
@@ -75,7 +77,7 @@ public:
 
   // Network::ReadFilter
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override;
-  Network::FilterStatus onData(Buffer::Instance& data) override;
+  Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override { return Network::FilterStatus::Continue; }
 
   // Network::ConnectionCallbacks

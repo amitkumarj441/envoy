@@ -1,4 +1,8 @@
+#include "envoy/api/v2/discovery.pb.h"
+#include "envoy/api/v2/eds.pb.h"
+
 #include "common/config/grpc_mux_impl.h"
+#include "common/config/protobuf_link_hacks.h"
 #include "common/config/resources.h"
 #include "common/protobuf/protobuf.h"
 
@@ -7,8 +11,6 @@
 #include "test/mocks/grpc/mocks.h"
 #include "test/test_common/utility.h"
 
-#include "api/discovery.pb.h"
-#include "api/eds.pb.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -23,24 +25,21 @@ namespace Envoy {
 namespace Config {
 namespace {
 
-typedef Grpc::MockAsyncClient<envoy::api::v2::DiscoveryRequest, envoy::api::v2::DiscoveryResponse>
-    SubscriptionMockAsyncClient;
-
 // We test some mux specific stuff below, other unit test coverage for singleton use of GrpcMuxImpl
 // is provided in [grpc_]subscription_impl_test.cc.
 class GrpcMuxImplTest : public testing::Test {
 public:
-  GrpcMuxImplTest()
-      : async_client_(new SubscriptionMockAsyncClient()), timer_(new Event::MockTimer()) {
+  GrpcMuxImplTest() : async_client_(new Grpc::MockAsyncClient()), timer_(new Event::MockTimer()) {
     EXPECT_CALL(dispatcher_, createTimer_(_)).WillOnce(Invoke([this](Event::TimerCb timer_cb) {
       timer_cb_ = timer_cb;
       return timer_;
     }));
-    grpc_mux_.reset(
-        new GrpcMuxImpl(envoy::api::v2::Node(),
-                        std::unique_ptr<SubscriptionMockAsyncClient>(async_client_), dispatcher_,
-                        *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
-                            "envoy.api.v2.AggregatedDiscoveryService.StreamAggregatedResources")));
+
+    grpc_mux_.reset(new GrpcMuxImpl(
+        envoy::api::v2::core::Node(), std::unique_ptr<Grpc::MockAsyncClient>(async_client_),
+        dispatcher_,
+        *Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
+            "envoy.service.discovery.v2.AggregatedDiscoveryService.StreamAggregatedResources")));
   }
 
   void expectSendMessage(const std::string& type_url,
@@ -59,12 +58,12 @@ public:
     EXPECT_CALL(async_stream_, sendMessage(ProtoEq(expected_request), false));
   }
 
-  envoy::api::v2::Node node_;
+  envoy::api::v2::core::Node node_;
   NiceMock<Event::MockDispatcher> dispatcher_;
-  SubscriptionMockAsyncClient* async_client_;
+  Grpc::MockAsyncClient* async_client_;
   Event::MockTimer* timer_;
   Event::TimerCb timer_cb_;
-  Grpc::MockAsyncStream<envoy::api::v2::DiscoveryRequest> async_stream_;
+  Grpc::MockAsyncStream async_stream_;
   std::unique_ptr<GrpcMuxImpl> grpc_mux_;
   MockGrpcMuxCallbacks callbacks_;
 };
@@ -84,7 +83,6 @@ TEST_F(GrpcMuxImplTest, MultipleTypeUrlStreams) {
   expectSendMessage("bar", {"zz", "z"}, "");
   auto bar_zz_sub = grpc_mux_->subscribe("bar", {"zz"}, callbacks_);
   expectSendMessage("bar", {"z"}, "");
-  expectSendMessage("bar", {}, "");
   expectSendMessage("bar", {}, "");
   expectSendMessage("foo", {}, "");
 }
@@ -111,8 +109,27 @@ TEST_F(GrpcMuxImplTest, ResetStream) {
   timer_cb_();
 
   expectSendMessage("baz", {}, "");
-  expectSendMessage("bar", {}, "");
   expectSendMessage("foo", {}, "");
+}
+
+// Validate pause-resume behavior.
+TEST_F(GrpcMuxImplTest, PauseResume) {
+  InSequence s;
+  auto foo_sub = grpc_mux_->subscribe("foo", {"x", "y"}, callbacks_);
+  grpc_mux_->pause("foo");
+  EXPECT_CALL(*async_client_, start(_, _)).WillOnce(Return(&async_stream_));
+  grpc_mux_->start();
+  expectSendMessage("foo", {"x", "y"}, "");
+  grpc_mux_->resume("foo");
+  grpc_mux_->pause("bar");
+  expectSendMessage("foo", {"z", "x", "y"}, "");
+  auto foo_z_sub = grpc_mux_->subscribe("foo", {"z"}, callbacks_);
+  grpc_mux_->resume("bar");
+  grpc_mux_->pause("foo");
+  auto foo_zz_sub = grpc_mux_->subscribe("foo", {"zz"}, callbacks_);
+  expectSendMessage("foo", {"zz", "z", "x", "y"}, "");
+  grpc_mux_->resume("foo");
+  grpc_mux_->pause("foo");
 }
 
 // Validate behavior when type URL mismatches occur.
@@ -175,8 +192,6 @@ TEST_F(GrpcMuxImplTest, WildcardWatch) {
     expectSendMessage(type_url, {}, "1");
     grpc_mux_->onReceiveMessage(std::move(response));
   }
-
-  expectSendMessage(type_url, {}, "1");
 }
 
 // Validate behavior when watches specify resources (potentially overlapping).

@@ -4,12 +4,14 @@ load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_library",
     "envoy_package",
+    "envoy_select_google_grpc",
 )
 
 envoy_package()
 
 envoy_cc_library(
     name = "async_client_lib",
+    srcs = ["async_client_impl.cc"],
     hdrs = ["async_client_impl.h"],
     deps = [
         ":codec_lib",
@@ -21,12 +23,26 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "async_client_manager_lib",
+    srcs = ["async_client_manager_impl.cc"],
+    hdrs = ["async_client_manager_impl.h"],
+    deps = [
+        ":async_client_lib",
+        "//include/envoy/grpc:async_client_manager_interface",
+        "//include/envoy/singleton:manager_interface",
+        "//include/envoy/thread_local:thread_local_interface",
+        "//include/envoy/upstream:cluster_manager_interface",
+    ] + envoy_select_google_grpc([":google_async_client_lib"]),
+)
+
+envoy_cc_library(
     name = "codec_lib",
     srcs = ["codec.cc"],
     hdrs = ["codec.h"],
     deps = [
         "//include/envoy/buffer:buffer_interface",
         "//source/common/buffer:buffer_lib",
+        "//source/common/common:logger_lib",
     ],
 )
 
@@ -53,6 +69,26 @@ envoy_cc_library(
         "//source/common/http:message_lib",
         "//source/common/http:utility_lib",
         "//source/common/protobuf",
+    ],
+)
+
+envoy_cc_library(
+    name = "google_async_client_lib",
+    srcs = [
+        "google_async_client_impl.cc",
+        "google_async_client_site.cc",
+    ],
+    hdrs = ["google_async_client_impl.h"],
+    external_deps = ["grpc"],
+    deps = [
+        "//include/envoy/grpc:async_client_interface",
+        "//include/envoy/thread_local:thread_local_interface",
+        "//source/common/common:empty_string",
+        "//source/common/common:linked_object",
+        "//source/common/common:thread_annotations",
+        "//source/common/common:thread_lib",
+        "//source/common/config:datasource_lib",
+        "//source/common/tracing:http_tracer_lib",
     ],
 )
 
@@ -89,6 +125,7 @@ envoy_cc_library(
         "//source/common/common:base64_lib",
         "//source/common/http:headers_lib",
         "//source/common/protobuf",
+        "@envoy_api//envoy/config/filter/http/transcoder/v2:transcoder_cc",
     ],
 )
 
@@ -108,30 +145,9 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "rpc_channel_lib",
-    srcs = ["rpc_channel_impl.cc"],
-    hdrs = ["rpc_channel_impl.h"],
-    deps = [
-        ":common_lib",
-        "//include/envoy/grpc:rpc_channel_interface",
-        "//include/envoy/upstream:cluster_manager_interface",
-        "//source/common/buffer:zero_copy_input_stream_lib",
-        "//source/common/common:assert_lib",
-        "//source/common/common:enum_to_int",
-        "//source/common/common:utility_lib",
-        "//source/common/http:headers_lib",
-        "//source/common/http:message_lib",
-        "//source/common/http:utility_lib",
-        "//source/common/protobuf",
-    ],
-)
-
-envoy_cc_library(
     name = "transcoder_input_stream_lib",
     srcs = ["transcoder_input_stream_impl.cc"],
     hdrs = ["transcoder_input_stream_impl.h"],
     external_deps = ["grpc_transcoding"],
-    deps = [
-        "//source/common/buffer:zero_copy_input_stream_lib",
-    ],
+    deps = ["//source/common/buffer:zero_copy_input_stream_lib"],
 )

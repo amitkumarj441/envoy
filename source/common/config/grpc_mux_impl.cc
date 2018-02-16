@@ -8,31 +8,16 @@
 namespace Envoy {
 namespace Config {
 
-GrpcMuxImpl::GrpcMuxImpl(
-    const envoy::api::v2::Node& node,
-    std::unique_ptr<
-        Grpc::AsyncClient<envoy::api::v2::DiscoveryRequest, envoy::api::v2::DiscoveryResponse>>
-        async_client,
-    Event::Dispatcher& dispatcher, const Protobuf::MethodDescriptor& service_method)
+GrpcMuxImpl::GrpcMuxImpl(const envoy::api::v2::core::Node& node, Grpc::AsyncClientPtr async_client,
+                         Event::Dispatcher& dispatcher,
+                         const Protobuf::MethodDescriptor& service_method)
     : node_(node), async_client_(std::move(async_client)), service_method_(service_method) {
   retry_timer_ = dispatcher.createTimer([this]() -> void { establishNewStream(); });
 }
 
-GrpcMuxImpl::GrpcMuxImpl(const envoy::api::v2::Node& node,
-                         Upstream::ClusterManager& cluster_manager,
-                         const std::string& remote_cluster_name, Event::Dispatcher& dispatcher,
-                         const Protobuf::MethodDescriptor& service_method)
-    : GrpcMuxImpl(node,
-                  std::unique_ptr<Grpc::AsyncClientImpl<envoy::api::v2::DiscoveryRequest,
-                                                        envoy::api::v2::DiscoveryResponse>>(
-                      new Grpc::AsyncClientImpl<envoy::api::v2::DiscoveryRequest,
-                                                envoy::api::v2::DiscoveryResponse>(
-                          cluster_manager, remote_cluster_name)),
-                  dispatcher, service_method) {}
-
 GrpcMuxImpl::~GrpcMuxImpl() {
-  for (auto watches : watches_) {
-    for (auto watch : watches.second) {
+  for (const auto& api_state : api_state_) {
+    for (auto watch : api_state.second.watches_) {
       watch->inserted_ = false;
     }
   }
@@ -60,15 +45,23 @@ void GrpcMuxImpl::establishNewStream() {
 
 void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
   if (stream_ == nullptr) {
+    ENVOY_LOG(debug, "No stream available to sendDiscoveryRequest for {}", type_url);
     return;
   }
 
-  auto& request = requests_[type_url];
+  ApiState& api_state = api_state_[type_url];
+  if (api_state.paused_) {
+    ENVOY_LOG(trace, "API {} paused during sendDiscoveryRequest(), setting pending.", type_url);
+    api_state.pending_ = true;
+    return;
+  }
+
+  auto& request = api_state.request_;
   request.mutable_resource_names()->Clear();
 
   // Maintain a set to avoid dupes.
   std::unordered_set<std::string> resources;
-  for (const auto* watch : watches_[type_url]) {
+  for (const auto* watch : api_state.watches_) {
     for (const std::string& resource : watch->resources_) {
       if (resources.count(resource) == 0) {
         resources.emplace(resource);
@@ -82,8 +75,8 @@ void GrpcMuxImpl::sendDiscoveryRequest(const std::string& type_url) {
 }
 
 void GrpcMuxImpl::handleFailure() {
-  for (auto watches : watches_) {
-    for (auto watch : watches.second) {
+  for (const auto& api_state : api_state_) {
+    for (auto watch : api_state.second.watches_) {
       watch->callbacks_.onConfigUpdateFailed(nullptr);
     }
   }
@@ -100,9 +93,10 @@ GrpcMuxWatchPtr GrpcMuxImpl::subscribe(const std::string& type_url,
   // Lazily kick off the requests based on first subscription. This has the
   // convenient side-effect that we order messages on the channel based on
   // Envoy's internal dependency ordering.
-  if (requests_.count(type_url) == 0) {
-    requests_[type_url].set_type_url(type_url);
-    requests_[type_url].mutable_node()->MergeFrom(node_);
+  if (!api_state_[type_url].subscribed_) {
+    api_state_[type_url].request_.set_type_url(type_url);
+    api_state_[type_url].request_.mutable_node()->MergeFrom(node_);
+    api_state_[type_url].subscribed_ = true;
     subscriptions_.emplace_back(type_url);
   }
 
@@ -113,6 +107,27 @@ GrpcMuxWatchPtr GrpcMuxImpl::subscribe(const std::string& type_url,
   sendDiscoveryRequest(type_url);
 
   return watch;
+}
+
+void GrpcMuxImpl::pause(const std::string& type_url) {
+  ENVOY_LOG(debug, "Pausing discovery requests for {}", type_url);
+  ApiState& api_state = api_state_[type_url];
+  ASSERT(!api_state.paused_);
+  ASSERT(!api_state.pending_);
+  api_state.paused_ = true;
+}
+
+void GrpcMuxImpl::resume(const std::string& type_url) {
+  ENVOY_LOG(debug, "Resuming discovery requests for {}", type_url);
+  ApiState& api_state = api_state_[type_url];
+  ASSERT(api_state.paused_);
+  api_state.paused_ = false;
+
+  if (api_state.pending_) {
+    ASSERT(api_state.subscribed_);
+    sendDiscoveryRequest(type_url);
+    api_state.pending_ = false;
+  }
 }
 
 void GrpcMuxImpl::onCreateInitialMetadata(Http::HeaderMap& metadata) {
@@ -126,7 +141,7 @@ void GrpcMuxImpl::onReceiveInitialMetadata(Http::HeaderMapPtr&& metadata) {
 void GrpcMuxImpl::onReceiveMessage(std::unique_ptr<envoy::api::v2::DiscoveryResponse>&& message) {
   const std::string& type_url = message->type_url();
   ENVOY_LOG(debug, "Received gRPC message for {} at version {}", type_url, message->version_info());
-  if (requests_.count(type_url) == 0) {
+  if (api_state_.count(type_url) == 0) {
     ENVOY_LOG(warn, "Ignoring unknown type URL {}", type_url);
     return;
   }
@@ -144,7 +159,7 @@ void GrpcMuxImpl::onReceiveMessage(std::unique_ptr<envoy::api::v2::DiscoveryResp
       const std::string resource_name = Utility::resourceName(resource);
       resources.emplace(resource_name, resource);
     }
-    for (auto watch : watches_[type_url]) {
+    for (auto watch : api_state_[type_url].watches_) {
       if (watch->resources_.empty()) {
         watch->callbacks_.onConfigUpdate(message->resources(), message->version_info());
         continue;
@@ -158,14 +173,14 @@ void GrpcMuxImpl::onReceiveMessage(std::unique_ptr<envoy::api::v2::DiscoveryResp
       }
       watch->callbacks_.onConfigUpdate(found_resources, message->version_info());
     }
-    requests_[type_url].set_version_info(message->version_info());
+    api_state_[type_url].request_.set_version_info(message->version_info());
   } catch (const EnvoyException& e) {
     ENVOY_LOG(warn, "gRPC config for {} update rejected: {}", message->type_url(), e.what());
-    for (auto watch : watches_[type_url]) {
+    for (auto watch : api_state_[type_url].watches_) {
       watch->callbacks_.onConfigUpdateFailed(&e);
     }
   }
-  requests_[type_url].set_response_nonce(message->nonce());
+  api_state_[type_url].request_.set_response_nonce(message->nonce());
   sendDiscoveryRequest(type_url);
 }
 

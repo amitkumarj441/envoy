@@ -6,11 +6,11 @@ namespace Grpc {
 MockAsyncRequest::MockAsyncRequest() {}
 MockAsyncRequest::~MockAsyncRequest() {}
 
-MockRpcChannelCallbacks::MockRpcChannelCallbacks() {}
-MockRpcChannelCallbacks::~MockRpcChannelCallbacks() {}
+MockAsyncClientFactory::MockAsyncClientFactory() {}
+MockAsyncClientFactory::~MockAsyncClientFactory() {}
 
-MockRpcChannel::MockRpcChannel() {}
-MockRpcChannel::~MockRpcChannel() {}
+MockAsyncClientManager::MockAsyncClientManager() {}
+MockAsyncClientManager::~MockAsyncClientManager() {}
 
 } // namespace Grpc
 } // namespace Envoy

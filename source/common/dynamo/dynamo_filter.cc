@@ -7,14 +7,13 @@
 
 #include "common/buffer/buffer_impl.h"
 #include "common/common/assert.h"
+#include "common/common/fmt.h"
 #include "common/dynamo/dynamo_request_parser.h"
 #include "common/dynamo/dynamo_utility.h"
 #include "common/http/codes.h"
 #include "common/http/exception.h"
 #include "common/http/utility.h"
 #include "common/json/json_loader.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Dynamo {
@@ -23,9 +22,10 @@ Http::FilterHeadersStatus DynamoFilter::decodeHeaders(Http::HeaderMap& headers, 
   if (enabled_) {
     start_decode_ = std::chrono::steady_clock::now();
     operation_ = RequestParser::parseOperation(headers);
+    return Http::FilterHeadersStatus::StopIteration;
+  } else {
+    return Http::FilterHeadersStatus::Continue;
   }
-
-  return Http::FilterHeadersStatus::Continue;
 }
 
 Http::FilterDataStatus DynamoFilter::decodeData(Buffer::Instance& data, bool end_stream) {
@@ -33,7 +33,7 @@ Http::FilterDataStatus DynamoFilter::decodeData(Buffer::Instance& data, bool end
     onDecodeComplete(data);
   }
 
-  if (end_stream) {
+  if (!enabled_ || end_stream) {
     return Http::FilterDataStatus::Continue;
   } else {
     // Buffer until the complete request has been processed.
@@ -91,16 +91,19 @@ void DynamoFilter::onEncodeComplete(const Buffer::Instance& data) {
 }
 
 Http::FilterHeadersStatus DynamoFilter::encodeHeaders(Http::HeaderMap& headers, bool end_stream) {
+  Http::FilterHeadersStatus status = Http::FilterHeadersStatus::Continue;
   if (enabled_) {
     response_headers_ = &headers;
 
     if (end_stream) {
       Buffer::OwnedImpl empty;
       onEncodeComplete(empty);
+    } else {
+      status = Http::FilterHeadersStatus::StopIteration;
     }
   }
 
-  return Http::FilterHeadersStatus::Continue;
+  return status;
 }
 
 Http::FilterDataStatus DynamoFilter::encodeData(Buffer::Instance& data, bool end_stream) {
@@ -108,7 +111,7 @@ Http::FilterDataStatus DynamoFilter::encodeData(Buffer::Instance& data, bool end
     onEncodeComplete(data);
   }
 
-  if (end_stream) {
+  if (!enabled_ || end_stream) {
     return Http::FilterDataStatus::Continue;
   } else {
     // Buffer until the complete response has been processed.
@@ -181,14 +184,16 @@ void DynamoFilter::chargeStatsPerEntity(const std::string& entity, const std::st
                            std::to_string(status)))
       .inc();
 
-  scope_.deliverTimingToSinks(
-      fmt::format("{}{}.{}.upstream_rq_time", stat_prefix_, entity_type, entity), latency);
-  scope_.deliverTimingToSinks(
-      fmt::format("{}{}.{}.upstream_rq_time_{}", stat_prefix_, entity_type, entity, group_string),
-      latency);
-  scope_.deliverTimingToSinks(fmt::format("{}{}.{}.upstream_rq_time_{}", stat_prefix_, entity_type,
-                                          entity, std::to_string(status)),
-                              latency);
+  scope_.histogram(fmt::format("{}{}.{}.upstream_rq_time", stat_prefix_, entity_type, entity))
+      .recordValue(latency.count());
+  scope_
+      .histogram(fmt::format("{}{}.{}.upstream_rq_time_{}", stat_prefix_, entity_type, entity,
+                             group_string))
+      .recordValue(latency.count());
+  scope_
+      .histogram(fmt::format("{}{}.{}.upstream_rq_time_{}", stat_prefix_, entity_type, entity,
+                             std::to_string(status)))
+      .recordValue(latency.count());
 }
 
 void DynamoFilter::chargeUnProcessedKeysStats(const Json::Object& json_body) {

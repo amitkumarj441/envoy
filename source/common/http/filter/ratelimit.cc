@@ -6,12 +6,10 @@
 #include "envoy/http/codes.h"
 
 #include "common/common/assert.h"
-#include "common/common/empty_string.h"
 #include "common/common/enum_to_int.h"
+#include "common/common/fmt.h"
 #include "common/http/codes.h"
 #include "common/router/config_impl.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Http {
@@ -63,10 +61,7 @@ void Filter::initiateCall(const HeaderMap& headers) {
   if (!descriptors.empty()) {
     state_ = State::Calling;
     initiating_call_ = true;
-    client_->limit(
-        *this, config_->domain(), descriptors,
-        {headers.RequestId() ? headers.RequestId()->value().c_str() : EMPTY_STRING,
-         headers.OtSpanContext() ? headers.OtSpanContext()->value().c_str() : EMPTY_STRING});
+    client_->limit(*this, config_->domain(), descriptors, callbacks_->activeSpan());
     initiating_call_ = false;
   }
 }
@@ -123,7 +118,7 @@ void Filter::complete(Envoy::RateLimit::LimitStatus status) {
     Http::CodeUtility::ResponseStatInfo info{config_->scope(),
                                              cluster_->statsScope(),
                                              EMPTY_STRING,
-                                             *getTooManyRequestsHeader(),
+                                             enumToInt(Code::TooManyRequests),
                                              true,
                                              EMPTY_STRING,
                                              EMPTY_STRING,
@@ -139,7 +134,7 @@ void Filter::complete(Envoy::RateLimit::LimitStatus status) {
     state_ = State::Responded;
     Http::HeaderMapPtr response_headers{new HeaderMapImpl(*getTooManyRequestsHeader())};
     callbacks_->encodeHeaders(std::move(response_headers), true);
-    callbacks_->requestInfo().setResponseFlag(Http::AccessLog::ResponseFlag::RateLimited);
+    callbacks_->requestInfo().setResponseFlag(RequestInfo::ResponseFlag::RateLimited);
   } else if (!initiating_call_) {
     callbacks_->continueDecoding();
   }
@@ -158,7 +153,7 @@ void Filter::populateRateLimitDescriptors(const Router::RateLimitPolicy& rate_li
       continue;
     }
     rate_limit.populateDescriptors(*route_entry, descriptors, config_->localInfo().clusterName(),
-                                   headers, callbacks_->downstreamAddress());
+                                   headers, *callbacks_->requestInfo().downstreamRemoteAddress());
   }
 }
 

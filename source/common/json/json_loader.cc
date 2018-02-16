@@ -10,11 +10,10 @@
 #include <vector>
 
 #include "common/common/assert.h"
+#include "common/common/fmt.h"
 #include "common/common/hash.h"
 #include "common/common/utility.h"
 #include "common/filesystem/filesystem_impl.h"
-
-#include "fmt/format.h"
 
 // Do not let RapidJson leak outside of this file.
 #include "rapidjson/document.h"
@@ -172,8 +171,8 @@ private:
   static void buildRapidJsonDocument(const Field& field, rapidjson::Value& value,
                                      rapidjson::Document::AllocatorType& allocator);
 
-  uint64_t line_number_start_;
-  uint64_t line_number_end_;
+  uint64_t line_number_start_ = 0;
+  uint64_t line_number_end_ = 0;
   const Type type_;
   Value value_;
 };
@@ -744,6 +743,14 @@ ObjectSharedPtr Factory::loadFromYamlString(const std::string& yaml) {
     return parseYamlNode(YAML::Load(yaml));
   } catch (YAML::ParserException& e) {
     throw EnvoyException(e.what());
+  } catch (YAML::BadConversion& e) {
+    throw EnvoyException(e.what());
+  } catch (std::exception& e) {
+    // There is a potentially wide space of exceptions thrown by the YAML parser,
+    // and enumerating them all may be difficult. Envoy doesn't work well with
+    // unhandled exceptions, so we capture them and record the exception name in
+    // the Envoy Exception text.
+    throw EnvoyException(fmt::format("Unexpected YAML exception: {}", +e.what()));
   }
 }
 

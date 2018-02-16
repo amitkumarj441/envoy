@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "envoy/config/filter/network/http_connection_manager/v2/http_connection_manager.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/init/init.h"
 #include "envoy/json/json_object.h"
@@ -11,8 +12,6 @@
 #include "envoy/stats/stats.h"
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/upstream/cluster_manager.h"
-
-#include "api/filter/http_connection_manager.pb.h"
 
 namespace Envoy {
 namespace Router {
@@ -38,10 +37,10 @@ public:
    * @param stat_prefix supplies the stat_prefix to use for the provider stats.
    * @param init_manager supplies the init manager.
    */
-  virtual RouteConfigProviderSharedPtr
-  getRouteConfigProvider(const envoy::api::v2::filter::Rds& rds, Upstream::ClusterManager& cm,
-                         Stats::Scope& scope, const std::string& stat_prefix,
-                         Init::Manager& init_manager) PURE;
+  virtual RouteConfigProviderSharedPtr getRouteConfigProvider(
+      const envoy::config::filter::network::http_connection_manager::v2::Rds& rds,
+      Upstream::ClusterManager& cm, Stats::Scope& scope, const std::string& stat_prefix,
+      Init::Manager& init_manager) PURE;
 };
 
 /**

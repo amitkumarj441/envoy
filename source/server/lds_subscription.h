@@ -1,13 +1,13 @@
 #pragma once
 
+#include "envoy/api/v2/lds.pb.h"
+#include "envoy/api/v2/listener/listener.pb.h"
 #include "envoy/config/subscription.h"
 
 #include "common/common/assert.h"
 #include "common/common/logger.h"
 #include "common/http/rest_api_fetcher.h"
 #include "common/json/json_validator.h"
-
-#include "api/lds.pb.h"
 
 namespace Envoy {
 namespace Server {
@@ -20,7 +20,8 @@ class LdsSubscription : public Http::RestApiFetcher,
                         public Config::Subscription<envoy::api::v2::Listener>,
                         Logger::Loggable<Logger::Id::upstream> {
 public:
-  LdsSubscription(Config::SubscriptionStats stats, const envoy::api::v2::ConfigSource& lds_config,
+  LdsSubscription(Config::SubscriptionStats stats,
+                  const envoy::api::v2::core::ConfigSource& lds_config,
                   Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher,
                   Runtime::RandomGenerator& random, const LocalInfo::LocalInfo& local_info);
 
@@ -52,7 +53,7 @@ private:
 
   std::string version_info_;
   const LocalInfo::LocalInfo& local_info_;
-  Config::SubscriptionCallbacks<envoy::api::v2::Listener>* callbacks_;
+  Config::SubscriptionCallbacks<envoy::api::v2::Listener>* callbacks_ = nullptr;
   Config::SubscriptionStats stats_;
 };
 

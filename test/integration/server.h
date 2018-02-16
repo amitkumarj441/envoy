@@ -36,19 +36,24 @@ public:
   uint64_t baseId() override { return 0; }
   uint32_t concurrency() override { return 1; }
   const std::string& configPath() override { return config_path_; }
+  bool v2ConfigOnly() override { return false; }
   const std::string& adminAddressPath() override { return admin_address_path_; }
   Network::Address::IpVersion localAddressIpVersion() override { return local_address_ip_version_; }
   std::chrono::seconds drainTime() override { return std::chrono::seconds(1); }
   spdlog::level::level_enum logLevel() override { NOT_IMPLEMENTED; }
   std::chrono::seconds parentShutdownTime() override { return std::chrono::seconds(2); }
+  const std::string& logPath() override { return log_path_; }
   uint64_t restartEpoch() override { return 0; }
   std::chrono::milliseconds fileFlushIntervalMsec() override {
-    return std::chrono::milliseconds(10000);
+    return std::chrono::milliseconds(50);
   }
   Mode mode() const override { return Mode::Serve; }
   const std::string& serviceClusterName() override { return service_cluster_name_; }
   const std::string& serviceNodeName() override { return service_node_name_; }
   const std::string& serviceZone() override { return service_zone_; }
+  uint64_t maxStats() override { return 16384; }
+  uint64_t maxObjNameLength() override { return 60; }
+  bool hotRestartDisabled() override { return false; }
 
 private:
   const std::string config_path_;
@@ -57,6 +62,7 @@ private:
   const std::string service_cluster_name_;
   const std::string service_node_name_;
   const std::string service_zone_;
+  const std::string log_path_;
 };
 
 class TestDrainManager : public DrainManager {
@@ -98,14 +104,9 @@ public:
     return ScopePtr{new TestScopeWrapper(lock_, wrapped_scope_->createScope(name))};
   }
 
-  void deliverHistogramToSinks(const std::string& name, uint64_t value) override {
+  void deliverHistogramToSinks(const Histogram& histogram, uint64_t value) override {
     std::unique_lock<std::mutex> lock(lock_);
-    wrapped_scope_->deliverHistogramToSinks(name, value);
-  }
-
-  void deliverTimingToSinks(const std::string& name, std::chrono::milliseconds ms) override {
-    std::unique_lock<std::mutex> lock(lock_);
-    wrapped_scope_->deliverTimingToSinks(name, ms);
+    wrapped_scope_->deliverHistogramToSinks(histogram, value);
   }
 
   Counter& counter(const std::string& name) override {
@@ -118,9 +119,9 @@ public:
     return wrapped_scope_->gauge(name);
   }
 
-  Timer& timer(const std::string& name) override {
+  Histogram& histogram(const std::string& name) override {
     std::unique_lock<std::mutex> lock(lock_);
-    return wrapped_scope_->timer(name);
+    return wrapped_scope_->histogram(name);
   }
 
 private:
@@ -143,15 +144,14 @@ public:
     std::unique_lock<std::mutex> lock(lock_);
     return ScopePtr{new TestScopeWrapper(lock_, store_.createScope(name))};
   }
-  void deliverHistogramToSinks(const std::string&, uint64_t) override {}
-  void deliverTimingToSinks(const std::string&, std::chrono::milliseconds) override {}
+  void deliverHistogramToSinks(const Histogram&, uint64_t) override {}
   Gauge& gauge(const std::string& name) override {
     std::unique_lock<std::mutex> lock(lock_);
     return store_.gauge(name);
   }
-  Timer& timer(const std::string& name) override {
+  Histogram& histogram(const std::string& name) override {
     std::unique_lock<std::mutex> lock(lock_);
-    return store_.timer(name);
+    return store_.histogram(name);
   }
 
   // Stats::Store
@@ -166,6 +166,7 @@ public:
 
   // Stats::StoreRoot
   void addSink(Sink&) override {}
+  void setTagProducer(TagProducerPtr&&) override {}
   void initializeThreading(Event::Dispatcher&, ThreadLocal::Instance&) override {}
   void shutdownThreading() override {}
 
@@ -187,7 +188,8 @@ class IntegrationTestServer : Logger::Loggable<Logger::Id::testing>,
                               public Server::ComponentFactory {
 public:
   static IntegrationTestServerPtr create(const std::string& config_path,
-                                         const Network::Address::IpVersion version);
+                                         const Network::Address::IpVersion version,
+                                         std::function<void()> pre_worker_start_test_steps);
   ~IntegrationTestServer();
 
   Server::TestDrainManager& drainManager() { return *drain_manager_; }
@@ -201,17 +203,24 @@ public:
   void setOnWorkerListenerRemovedCb(std::function<void()> on_worker_listener_removed) {
     on_worker_listener_removed_cb_ = on_worker_listener_removed;
   }
-  void start(const Network::Address::IpVersion version);
+  void start(const Network::Address::IpVersion version,
+             std::function<void()> pre_worker_start_test_steps);
   void start();
 
   void waitForCounterGe(const std::string& name, uint64_t value) {
-    while (counter(name)->value() < value) {
+    while (counter(name) == nullptr || counter(name)->value() < value) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
   void waitForGaugeGe(const std::string& name, uint64_t value) {
-    while (gauge(name)->value() < value) {
+    while (gauge(name) == nullptr || gauge(name)->value() < value) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
+  void waitForGaugeEq(const std::string& name, uint64_t value) {
+    while (gauge(name) == nullptr || gauge(name)->value() != value) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
@@ -227,6 +236,10 @@ public:
     // to test if a counter exists at all versus just defaulting to zero.
     return TestUtility::findGauge(*stat_store_, name);
   }
+
+  std::list<Stats::CounterSharedPtr> counters() { return stat_store_->counters(); }
+
+  std::list<Stats::GaugeSharedPtr> gauges() { return stat_store_->gauges(); }
 
   // TestHooks
   void onWorkerListenerAdded() override;

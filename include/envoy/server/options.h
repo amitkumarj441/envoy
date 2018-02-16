@@ -65,6 +65,12 @@ public:
   virtual const std::string& configPath() PURE;
 
   /**
+   * @return bool whether the config should only be parsed as v2. If false, when a v2 parse fails,
+   *              a second attempt to parse the config as v1 will be made.
+   */
+  virtual bool v2ConfigOnly() PURE;
+
+  /**
    * @return const std::string& the admin address output file.
    */
   virtual const std::string& adminAddressPath() PURE;
@@ -78,6 +84,11 @@ public:
    * @return spdlog::level::level_enum the default log level for the server.
    */
   virtual spdlog::level::level_enum logLevel() PURE;
+
+  /**
+   * @return const std::string& the log file path.
+   */
+  virtual const std::string& logPath() PURE;
 
   /**
    * @return the number of seconds that envoy will wait before shutting down the parent envoy during
@@ -115,6 +126,22 @@ public:
    * @return const std::string& the server's zone.
    */
   virtual const std::string& serviceZone() PURE;
+
+  /**
+   * @return uint64_t the maximum number of stats gauges and counters.
+   */
+  virtual uint64_t maxStats() PURE;
+
+  /**
+   * @return uint64_t the maximum name length of the name field in
+   * router/cluster/listener.
+   */
+  virtual uint64_t maxObjNameLength() PURE;
+
+  /**
+   * @return bool indicating whether the hot restart functionality has been disabled via cli flags.
+   */
+  virtual bool hotRestartDisabled() PURE;
 };
 
 } // namespace Server

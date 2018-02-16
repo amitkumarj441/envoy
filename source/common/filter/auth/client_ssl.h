@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "envoy/config/filter/network/client_ssl_auth/v2/client_ssl_auth.pb.h"
 #include "envoy/network/filter.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats_macros.h"
@@ -12,9 +13,9 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/http/rest_api_fetcher.h"
-#include "common/json/json_loader.h"
 #include "common/network/cidr_range.h"
 #include "common/network/utility.h"
+#include "common/protobuf/utility.h"
 
 namespace Envoy {
 namespace Filter {
@@ -73,16 +74,18 @@ typedef std::shared_ptr<Config> ConfigSharedPtr;
  */
 class Config : public Http::RestApiFetcher {
 public:
-  static ConfigSharedPtr create(const Json::Object& config, ThreadLocal::SlotAllocator& tls,
-                                Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher,
-                                Stats::Scope& scope, Runtime::RandomGenerator& random);
+  static ConfigSharedPtr
+  create(const envoy::config::filter::network::client_ssl_auth::v2::ClientSSLAuth& config,
+         ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cm,
+         Event::Dispatcher& dispatcher, Stats::Scope& scope, Runtime::RandomGenerator& random);
 
   const AllowedPrincipals& allowedPrincipals();
   const Network::Address::IpList& ipWhiteList() { return ip_white_list_; }
   GlobalStats& stats() { return stats_; }
 
 private:
-  Config(const Json::Object& config, ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cm,
+  Config(const envoy::config::filter::network::client_ssl_auth::v2::ClientSSLAuth& config,
+         ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cm,
          Event::Dispatcher& dispatcher, Stats::Scope& scope, Runtime::RandomGenerator& random);
 
   static GlobalStats generateStats(Stats::Scope& scope, const std::string& prefix);
@@ -106,7 +109,7 @@ public:
   Instance(ConfigSharedPtr config) : config_(config) {}
 
   // Network::ReadFilter
-  Network::FilterStatus onData(Buffer::Instance& data) override;
+  Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override {
     read_callbacks_ = &callbacks;

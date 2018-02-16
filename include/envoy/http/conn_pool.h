@@ -70,16 +70,30 @@ public:
   virtual ~Instance() {}
 
   /**
+   * @return Http::Protocol Reports the protocol in use by this connection pool.
+   */
+  virtual Http::Protocol protocol() const PURE;
+
+  /**
    * Called when a connection pool has been drained of pending requests, busy connections, and
    * ready connections.
    */
   typedef std::function<void()> DrainedCb;
 
   /**
-   * Invoke connection pool draining and register a callback that gets called when draining is
-   * complete.
+   * Register a callback that gets called when the connection pool is fully drained. No actual
+   * draining is done. The owner of the connection pool is responsible for not creating any
+   * new streams.
    */
   virtual void addDrainedCallback(DrainedCb cb) PURE;
+
+  /**
+   * Actively drain all existing connection pool connections. This method can be used in cases
+   * where the connection pool is not being destroyed, but the caller wishes to make sure that
+   * all new streams take place on a new connection. For example, when a health check failure
+   * occurs.
+   */
+  virtual void drainConnections() PURE;
 
   /**
    * Create a new stream on the pool.

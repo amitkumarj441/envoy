@@ -9,6 +9,7 @@
 #include "envoy/event/timer.h"
 #include "envoy/http/conn_pool.h"
 #include "envoy/network/connection.h"
+#include "envoy/stats/timespan.h"
 #include "envoy/upstream/upstream.h"
 
 #include "common/common/linked_object.h"
@@ -28,13 +29,16 @@ namespace Http1 {
 class ConnPoolImpl : Logger::Loggable<Logger::Id::pool>, public ConnectionPool::Instance {
 public:
   ConnPoolImpl(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-               Upstream::ResourcePriority priority)
-      : dispatcher_(dispatcher), host_(host), priority_(priority) {}
+               Upstream::ResourcePriority priority,
+               const Network::ConnectionSocket::OptionsSharedPtr& options)
+      : dispatcher_(dispatcher), host_(host), priority_(priority), socket_options_(options) {}
 
   ~ConnPoolImpl();
 
   // ConnectionPool::Instance
+  Http::Protocol protocol() const override { return Http::Protocol::Http11; }
   void addDrainedCallback(DrainedCb cb) override;
+  void drainConnections() override;
   ConnectionPool::Cancellable* newStream(StreamDecoder& response_decoder,
                                          ConnectionPool::Callbacks& callbacks) override;
 
@@ -128,6 +132,7 @@ protected:
   std::list<PendingRequestPtr> pending_requests_;
   std::list<DrainedCb> drained_callbacks_;
   Upstream::ResourcePriority priority_;
+  const Network::ConnectionSocket::OptionsSharedPtr socket_options_;
 };
 
 /**
@@ -136,8 +141,9 @@ protected:
 class ConnPoolImplProd : public ConnPoolImpl {
 public:
   ConnPoolImplProd(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-                   Upstream::ResourcePriority priority)
-      : ConnPoolImpl(dispatcher, host, priority) {}
+                   Upstream::ResourcePriority priority,
+                   const Network::ConnectionSocket::OptionsSharedPtr& options)
+      : ConnPoolImpl(dispatcher, host, priority, options) {}
 
   // ConnPoolImpl
   CodecClientPtr createCodecClient(Upstream::Host::CreateConnectionData& data) override;

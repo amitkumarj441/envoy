@@ -5,9 +5,6 @@
 
 #include "envoy/upstream/load_balancer.h"
 
-#include "common/network/utility.h"
-#include "common/upstream/upstream_impl.h"
-
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -20,79 +17,52 @@ using testing::_;
 
 namespace Envoy {
 namespace Upstream {
-namespace Outlier {
 
-MockDetectorHostMonitor::MockDetectorHostMonitor() {}
-MockDetectorHostMonitor::~MockDetectorHostMonitor() {}
-
-MockEventLogger::MockEventLogger() {}
-MockEventLogger::~MockEventLogger() {}
-
-MockDetector::MockDetector() {
-  ON_CALL(*this, addChangedStateCb(_)).WillByDefault(Invoke([this](ChangeStateCb cb) -> void {
-    callbacks_.push_back(cb);
-  }));
-}
-
-MockDetector::~MockDetector() {}
-
-} // namespace Outlier
-
-MockHealthCheckHostMonitor::MockHealthCheckHostMonitor() {}
-MockHealthCheckHostMonitor::~MockHealthCheckHostMonitor() {}
-
-MockHostDescription::MockHostDescription()
-    : address_(Network::Utility::resolveUrl("tcp://10.0.0.1:443")) {
-  ON_CALL(*this, hostname()).WillByDefault(ReturnRef(hostname_));
-  ON_CALL(*this, address()).WillByDefault(Return(address_));
-  ON_CALL(*this, outlierDetector()).WillByDefault(ReturnRef(outlier_detector_));
-  ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
-  ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
-  ON_CALL(*this, healthChecker()).WillByDefault(ReturnRef(health_checker_));
-}
-
-MockHostDescription::~MockHostDescription() {}
-
-MockHost::MockHost() {
-  ON_CALL(*this, cluster()).WillByDefault(ReturnRef(cluster_));
-  ON_CALL(*this, outlierDetector()).WillByDefault(ReturnRef(outlier_detector_));
-  ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
-}
-
-MockHost::~MockHost() {}
-
-MockClusterInfo::MockClusterInfo()
-    : stats_(ClusterInfoImpl::generateStats(stats_store_)),
-      resource_manager_(new Upstream::ResourceManagerImpl(runtime_, "fake_key", 1, 1024, 1024, 1)) {
-
-  ON_CALL(*this, connectTimeout()).WillByDefault(Return(std::chrono::milliseconds(1)));
-  ON_CALL(*this, name()).WillByDefault(ReturnRef(name_));
-  ON_CALL(*this, http2Settings()).WillByDefault(ReturnRef(http2_settings_));
-  ON_CALL(*this, maxRequestsPerConnection())
-      .WillByDefault(ReturnPointee(&max_requests_per_connection_));
-  ON_CALL(*this, stats()).WillByDefault(ReturnRef(stats_));
-  ON_CALL(*this, statsScope()).WillByDefault(ReturnRef(stats_store_));
-  ON_CALL(*this, sourceAddress()).WillByDefault(ReturnRef(source_address_));
-  ON_CALL(*this, resourceManager(_))
-      .WillByDefault(Invoke(
-          [this](ResourcePriority) -> Upstream::ResourceManager& { return *resource_manager_; }));
-  ON_CALL(*this, lbType()).WillByDefault(ReturnPointee(&lb_type_));
-  ON_CALL(*this, sourceAddress()).WillByDefault(ReturnRef(source_address_));
-}
-
-MockClusterInfo::~MockClusterInfo() {}
-
-MockCluster::MockCluster() {
-  ON_CALL(*this, addMemberUpdateCb(_))
-      .WillByDefault(Invoke([this](MemberUpdateCb cb) -> Common::CallbackHandle* {
-        return member_update_cb_helper_.add(cb);
-      }));
+MockHostSet::MockHostSet(uint32_t priority) : priority_(priority) {
+  ON_CALL(*this, priority()).WillByDefault(Return(priority_));
   ON_CALL(*this, hosts()).WillByDefault(ReturnRef(hosts_));
   ON_CALL(*this, healthyHosts()).WillByDefault(ReturnRef(healthy_hosts_));
-  ON_CALL(*this, hostsPerZone()).WillByDefault(ReturnRef(hosts_per_zone_));
-  ON_CALL(*this, healthyHostsPerZone()).WillByDefault(ReturnRef(healthy_hosts_per_zone_));
+  ON_CALL(*this, hostsPerLocality()).WillByDefault(Invoke([this]() -> const HostsPerLocality& {
+    return *hosts_per_locality_;
+  }));
+  ON_CALL(*this, healthyHostsPerLocality())
+      .WillByDefault(
+          Invoke([this]() -> const HostsPerLocality& { return *healthy_hosts_per_locality_; }));
+}
+
+MockPrioritySet::MockPrioritySet() {
+  getHostSet(0);
+  ON_CALL(*this, hostSetsPerPriority()).WillByDefault(ReturnRef(host_sets_));
+  ON_CALL(testing::Const(*this), hostSetsPerPriority()).WillByDefault(ReturnRef(host_sets_));
+  ON_CALL(*this, addMemberUpdateCb(_))
+      .WillByDefault(Invoke([this](PrioritySet::MemberUpdateCb cb) -> Common::CallbackHandle* {
+        return member_update_cb_helper_.add(cb);
+      }));
+}
+
+HostSet& MockPrioritySet::getHostSet(uint32_t priority) {
+  if (host_sets_.size() < priority + 1) {
+    for (size_t i = host_sets_.size(); i <= priority; ++i) {
+      auto host_set = new NiceMock<MockHostSet>(i);
+      host_sets_.push_back(HostSetPtr{host_set});
+      host_set->addMemberUpdateCb([this](uint32_t priority, const HostVector& hosts_added,
+                                         const HostVector& hosts_removed) {
+        runUpdateCallbacks(priority, hosts_added, hosts_removed);
+      });
+    }
+  }
+  return *host_sets_[priority];
+}
+void MockPrioritySet::runUpdateCallbacks(uint32_t priority, const HostVector& hosts_added,
+                                         const HostVector& hosts_removed) {
+  member_update_cb_helper_.runCallbacks(priority, hosts_added, hosts_removed);
+}
+
+MockCluster::MockCluster() {
+  ON_CALL(*this, prioritySet()).WillByDefault(ReturnRef(priority_set_));
+  ON_CALL(testing::Const(*this), prioritySet()).WillByDefault(ReturnRef(priority_set_));
   ON_CALL(*this, info()).WillByDefault(Return(info_));
-  ON_CALL(*this, setInitializedCb(_))
+  ON_CALL(*this, initialize(_))
       .WillByDefault(Invoke([this](std::function<void()> callback) -> void {
         EXPECT_EQ(nullptr, initialize_callback_);
         initialize_callback_ = callback;
@@ -106,7 +76,7 @@ MockLoadBalancer::MockLoadBalancer() { ON_CALL(*this, chooseHost(_)).WillByDefau
 MockLoadBalancer::~MockLoadBalancer() {}
 
 MockThreadLocalCluster::MockThreadLocalCluster() {
-  ON_CALL(*this, hostSet()).WillByDefault(ReturnRef(cluster_));
+  ON_CALL(*this, prioritySet()).WillByDefault(ReturnRef(cluster_.priority_set_));
   ON_CALL(*this, info()).WillByDefault(Return(cluster_.info_));
   ON_CALL(*this, loadBalancer()).WillByDefault(ReturnRef(lb_));
 }
@@ -114,10 +84,13 @@ MockThreadLocalCluster::MockThreadLocalCluster() {
 MockThreadLocalCluster::~MockThreadLocalCluster() {}
 
 MockClusterManager::MockClusterManager() {
-  ON_CALL(*this, httpConnPoolForCluster(_, _, _)).WillByDefault(Return(&conn_pool_));
+  ON_CALL(*this, httpConnPoolForCluster(_, _, _, _)).WillByDefault(Return(&conn_pool_));
   ON_CALL(*this, httpAsyncClientForCluster(_)).WillByDefault(ReturnRef(async_client_));
   ON_CALL(*this, httpAsyncClientForCluster(_)).WillByDefault((ReturnRef(async_client_)));
   ON_CALL(*this, sourceAddress()).WillByDefault(ReturnRef(source_address_));
+  ON_CALL(*this, adsMux()).WillByDefault(ReturnRef(ads_mux_));
+  ON_CALL(*this, grpcAsyncClientManager()).WillByDefault(ReturnRef(async_client_manager_));
+  ON_CALL(*this, localClusterName()).WillByDefault((ReturnRef(local_cluster_name_)));
 
   // Matches are LIFO so "" will match first.
   ON_CALL(*this, get(_)).WillByDefault(Return(&thread_local_cluster_));

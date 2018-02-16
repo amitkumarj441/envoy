@@ -12,6 +12,8 @@
 #include "envoy/network/filter.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/network/listener.h"
+#include "envoy/server/listener_manager.h"
+#include "envoy/stats/timespan.h"
 
 #include "common/common/linked_object.h"
 #include "common/common/non_copyable.h"
@@ -22,18 +24,18 @@ namespace Envoy {
 namespace Server {
 
 // clang-format off
-#define ALL_LISTENER_STATS(COUNTER, GAUGE, TIMER)                                                  \
-  COUNTER(downstream_cx_total)                                                                     \
-  COUNTER(downstream_cx_destroy)                                                                   \
-  GAUGE  (downstream_cx_active)                                                                    \
-  TIMER  (downstream_cx_length_ms)
+#define ALL_LISTENER_STATS(COUNTER, GAUGE, HISTOGRAM)                                              \
+  COUNTER  (downstream_cx_total)                                                                   \
+  COUNTER  (downstream_cx_destroy)                                                                 \
+  GAUGE    (downstream_cx_active)                                                                  \
+  HISTOGRAM(downstream_cx_length_ms)
 // clang-format on
 
 /**
  * Wrapper struct for listener stats. @see stats_macros.h
  */
 struct ListenerStats {
-  ALL_LISTENER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_TIMER_STRUCT)
+  ALL_LISTENER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 };
 
 /**
@@ -46,39 +48,36 @@ public:
 
   // Network::ConnectionHandler
   uint64_t numConnections() override { return num_connections_; }
-  void addListener(Network::FilterChainFactory& factory, Network::ListenSocket& socket,
-                   Stats::Scope& scope, uint64_t listener_tag,
-                   const Network::ListenerOptions& listener_options) override;
-  void addSslListener(Network::FilterChainFactory& factory, Ssl::ServerContext& ssl_ctx,
-                      Network::ListenSocket& socket, Stats::Scope& scope, uint64_t listener_tag,
-                      const Network::ListenerOptions& listener_options) override;
-  Network::Listener* findListenerByAddress(const Network::Address::Instance& address) override;
+  void addListener(Network::ListenerConfig& config) override;
   void removeListeners(uint64_t listener_tag) override;
   void stopListeners(uint64_t listener_tag) override;
   void stopListeners() override;
 
+  Network::Listener* findListenerByAddress(const Network::Address::Instance& address) override;
+
 private:
+  struct ActiveListener;
+  ActiveListener* findActiveListenerByAddress(const Network::Address::Instance& address);
+
   struct ActiveConnection;
   typedef std::unique_ptr<ActiveConnection> ActiveConnectionPtr;
+  struct ActiveSocket;
+  typedef std::unique_ptr<ActiveSocket> ActiveSocketPtr;
 
   /**
    * Wrapper for an active listener owned by this handler.
    */
   struct ActiveListener : public Network::ListenerCallbacks {
-    ActiveListener(ConnectionHandlerImpl& parent, Network::ListenSocket& socket,
-                   Network::FilterChainFactory& factory, Stats::Scope& scope, uint64_t listener_tag,
-                   const Network::ListenerOptions& listener_options);
+    ActiveListener(ConnectionHandlerImpl& parent, Network::ListenerConfig& config);
 
     ActiveListener(ConnectionHandlerImpl& parent, Network::ListenerPtr&& listener,
-                   Network::FilterChainFactory& factory, Stats::Scope& scope,
-                   uint64_t listener_tag);
+                   Network::ListenerConfig& config);
 
     ~ActiveListener();
 
-    /**
-     * Fires when a new connection is received from the listener.
-     * @param new_connection supplies the connection to take control of.
-     */
+    // Network::ListenerCallbacks
+    void onAccept(Network::ConnectionSocketPtr&& socket,
+                  bool hand_off_restored_destination_connections) override;
     void onNewConnection(Network::ConnectionPtr&& new_connection) override;
 
     /**
@@ -87,19 +86,18 @@ private:
      */
     void removeConnection(ActiveConnection& connection);
 
+    /**
+     * Create a new connection from a socket accepted by the listener.
+     */
+    void newConnection(Network::ConnectionSocketPtr&& socket);
+
     ConnectionHandlerImpl& parent_;
-    Network::FilterChainFactory& factory_;
     Network::ListenerPtr listener_;
     ListenerStats stats_;
+    std::list<ActiveSocketPtr> sockets_;
     std::list<ActiveConnectionPtr> connections_;
     const uint64_t listener_tag_;
-  };
-
-  struct SslActiveListener : public ActiveListener {
-    SslActiveListener(ConnectionHandlerImpl& parent, Ssl::ServerContext& ssl_ctx,
-                      Network::ListenSocket& socket, Network::FilterChainFactory& factory,
-                      Stats::Scope& scope, uint64_t listener_tag,
-                      const Network::ListenerOptions& listener_options);
+    Network::ListenerConfig& config_;
   };
 
   typedef std::unique_ptr<ActiveListener> ActiveListenerPtr;
@@ -129,9 +127,42 @@ private:
     Stats::TimespanPtr conn_length_;
   };
 
+  /**
+   * Wrapper for an active accepted socket owned by this handler.
+   */
+  struct ActiveSocket : public Network::ListenerFilterManager,
+                        public Network::ListenerFilterCallbacks,
+                        LinkedObject<ActiveSocket>,
+                        public Event::DeferredDeletable {
+    ActiveSocket(ActiveListener& listener, Network::ConnectionSocketPtr&& socket,
+                 bool hand_off_restored_destination_connections)
+        : listener_(listener), socket_(std::move(socket)),
+          hand_off_restored_destination_connections_(hand_off_restored_destination_connections),
+          iter_(accept_filters_.end()) {}
+    ~ActiveSocket() { accept_filters_.clear(); }
+
+    // Network::ListenerFilterManager
+    void addAcceptFilter(Network::ListenerFilterPtr&& filter) override {
+      accept_filters_.emplace_back(std::move(filter));
+    }
+
+    // Network::ListenerFilterCallbacks
+    Network::ConnectionSocket& socket() override { return *socket_.get(); }
+    Event::Dispatcher& dispatcher() override { return listener_.parent_.dispatcher_; }
+    void continueFilterChain(bool success) override;
+
+    ActiveListener& listener_;
+    Network::ConnectionSocketPtr socket_;
+    const bool hand_off_restored_destination_connections_;
+    std::list<Network::ListenerFilterPtr> accept_filters_;
+    std::list<Network::ListenerFilterPtr>::iterator iter_;
+  };
+
   static ListenerStats generateStats(Stats::Scope& scope);
 
+#ifndef NVLOG
   spdlog::logger& logger_;
+#endif
   Event::Dispatcher& dispatcher_;
   std::list<std::pair<Network::Address::InstanceConstSharedPtr, ActiveListenerPtr>> listeners_;
   std::atomic<uint64_t> num_connections_{};

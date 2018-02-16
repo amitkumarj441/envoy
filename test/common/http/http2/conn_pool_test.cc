@@ -22,6 +22,7 @@ using testing::DoAll;
 using testing::InSequence;
 using testing::Invoke;
 using testing::NiceMock;
+using testing::Property;
 using testing::Return;
 using testing::ReturnRef;
 using testing::SaveArg;
@@ -58,7 +59,8 @@ public:
     Event::MockTimer* connect_timer_;
   };
 
-  Http2ConnPoolImplTest() : pool_(dispatcher_, host_, Upstream::ResourcePriority::Default) {}
+  Http2ConnPoolImplTest()
+      : pool_(dispatcher_, host_, Upstream::ResourcePriority::Default, nullptr) {}
 
   ~Http2ConnPoolImplTest() {
     // Make sure all gauges are 0.
@@ -79,7 +81,7 @@ public:
         new CodecClientForTest(std::move(connection), test_client.codec_,
                                [this](CodecClient*) -> void { onClientDestroy(); }, nullptr);
 
-    EXPECT_CALL(dispatcher_, createClientConnection_(_, _))
+    EXPECT_CALL(dispatcher_, createClientConnection_(_, _, _, _))
         .WillOnce(Return(test_client.connection_));
     EXPECT_CALL(pool_, createCodecClient_(_))
         .WillOnce(Invoke([this](Upstream::Host::CreateConnectionData&) -> CodecClient* {
@@ -118,10 +120,45 @@ public:
   NiceMock<Http::MockStreamEncoder> inner_encoder_;
 };
 
+/**
+ * Verify that connections are drained when requested.
+ */
+TEST_F(Http2ConnPoolImplTest, DrainConnections) {
+  InSequence s;
+  pool_.max_streams_ = 1;
+
+  // Test drain connections call prior to any connections being created.
+  pool_.drainConnections();
+
+  expectClientCreate();
+  ActiveTestRequest r1(*this, 0);
+  EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));
+  r1.callbacks_.outer_encoder_->encodeHeaders(HeaderMapImpl{}, true);
+  expectClientConnect(0);
+
+  expectClientCreate();
+  ActiveTestRequest r2(*this, 1);
+  EXPECT_CALL(r2.inner_encoder_, encodeHeaders(_, true));
+  r2.callbacks_.outer_encoder_->encodeHeaders(HeaderMapImpl{}, true);
+  expectClientConnect(1);
+
+  // This will move primary to draining and destroy draining.
+  pool_.drainConnections();
+  EXPECT_CALL(*this, onClientDestroy());
+  dispatcher_.clearDeferredDeleteList();
+
+  // This will destroy draining.
+  test_clients_[1].connection_->raiseEvent(Network::ConnectionEvent::RemoteClose);
+  EXPECT_CALL(*this, onClientDestroy());
+  dispatcher_.clearDeferredDeleteList();
+}
+
 TEST_F(Http2ConnPoolImplTest, VerifyConnectionTimingStats) {
   expectClientCreate();
-  EXPECT_CALL(cluster_->stats_store_, deliverTimingToSinks("upstream_cx_connect_ms", _));
-  EXPECT_CALL(cluster_->stats_store_, deliverTimingToSinks("upstream_cx_length_ms", _));
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_connect_ms"), _));
+  EXPECT_CALL(cluster_->stats_store_,
+              deliverHistogramToSinks(Property(&Stats::Metric::name, "upstream_cx_length_ms"), _));
 
   ActiveTestRequest r1(*this, 0);
   EXPECT_CALL(r1.inner_encoder_, encodeHeaders(_, true));

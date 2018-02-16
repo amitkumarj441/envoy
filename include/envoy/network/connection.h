@@ -9,6 +9,7 @@
 #include "envoy/event/deferred_deletable.h"
 #include "envoy/network/address.h"
 #include "envoy/network/filter.h"
+#include "envoy/network/listen_socket.h"
 #include "envoy/ssl/connection.h"
 
 namespace Envoy {
@@ -72,12 +73,18 @@ class Connection : public Event::DeferredDeletable, public FilterManager {
 public:
   enum class State { Open, Closing, Closed };
 
+  /**
+   * Callback function for when bytes have been sent by a connection.
+   * @param bytes_sent supplies the number of bytes written to the connection.
+   */
+  typedef std::function<void(uint64_t bytes_sent)> BytesSentCb;
+
   struct ConnectionStats {
     Stats::Counter& read_total_;
     Stats::Gauge& read_current_;
     Stats::Counter& write_total_;
     Stats::Gauge& write_current_;
-    // Counter* as this is an optional counter.  Bind errors will not be tracked if this is nullptr.
+    // Counter* as this is an optional counter. Bind errors will not be tracked if this is nullptr.
     Stats::Counter* bind_errors_;
   };
 
@@ -87,6 +94,18 @@ public:
    * Register callbacks that fire when connection events occur.
    */
   virtual void addConnectionCallbacks(ConnectionCallbacks& cb) PURE;
+
+  /**
+   * Register for callback everytime bytes are written to the underlying TransportSocket.
+   */
+  virtual void addBytesSentCallback(BytesSentCb cb) PURE;
+
+  /**
+   * Enable half-close semantics on this connection. Reading a remote half-close
+   * will not fully close the connection. This is off by default.
+   * @param enabled Whether to set half-close semantics as enabled or disabled.
+   */
+  virtual void enableHalfClose(bool enabled) PURE;
 
   /**
    * Close the connection.
@@ -138,17 +157,17 @@ public:
   virtual bool readEnabled() const PURE;
 
   /**
-   * @return The address of the remote client.
+   * @return The address of the remote client. Note that this method will never return nullptr.
    */
-  virtual const Address::Instance& remoteAddress() const PURE;
+  virtual const Network::Address::InstanceConstSharedPtr& remoteAddress() const PURE;
 
   /**
    * @return the local address of the connection. For client connections, this is the origin
    * address. For server connections, this is the local destination address. For server connections
    * it can be different from the proxy address if the downstream connection has been redirected or
-   * the proxy is operating in transparent mode.
+   * the proxy is operating in transparent mode. Note that this method will never return nullptr.
    */
-  virtual const Address::Instance& localAddress() const PURE;
+  virtual const Network::Address::InstanceConstSharedPtr& localAddress() const PURE;
 
   /**
    * Set the stats to update for various connection state changes. Note that for performance reasons
@@ -175,16 +194,20 @@ public:
   /**
    * Write data to the connection. Will iterate through downstream filters with the buffer if any
    * are installed.
+   * @param data Supplies the data to write to the connection.
+   * @param end_stream If true, this indicates that this is the last write to the connection. If
+   *        end_stream is true, the connection is half-closed. This may only be set to true if
+   *        enableHalfClose(true) has been set on this connection.
    */
-  virtual void write(Buffer::Instance& data) PURE;
+  virtual void write(Buffer::Instance& data, bool end_stream) PURE;
 
   /**
    * Set a soft limit on the size of buffers for the connection.
    * For the read buffer, this limits the bytes read prior to flushing to further stages in the
    * processing pipeline.
-   * For the write buffer, it sets watermarks.  When enough data is buffered it triggers a call to
+   * For the write buffer, it sets watermarks. When enough data is buffered it triggers a call to
    * onAboveWriteBufferHighWatermark, which allows subscribers to enforce flow control by disabling
-   * reads on the socket funneling data to the write buffer.  When enough data is drained from the
+   * reads on the socket funneling data to the write buffer. When enough data is drained from the
    * write buffer, onBelowWriteBufferHighWatermark is called which similarly allows subscribers
    * resuming reading.
    */
@@ -196,15 +219,20 @@ public:
   virtual uint32_t bufferLimit() const PURE;
 
   /**
-   * @return boolean telling if the connection's local address is an original destination address,
-   * rather than the listener's address.
+   * @return boolean telling if the connection's local address has been restored to an original
+   *         destination address, rather than the address the connection was accepted at.
    */
-  virtual bool usingOriginalDst() const PURE;
+  virtual bool localAddressRestored() const PURE;
 
   /**
    * @return boolean telling if the connection is currently above the high watermark.
    */
   virtual bool aboveHighWatermark() const PURE;
+
+  /**
+   * Get the socket options set on this connection.
+   */
+  virtual const ConnectionSocket::OptionsSharedPtr& socketOptions() const PURE;
 };
 
 typedef std::unique_ptr<Connection> ConnectionPtr;
@@ -216,7 +244,7 @@ class ClientConnection : public virtual Connection {
 public:
   /**
    * Connect to a remote host. Errors or connection events are reported via the event callback
-   * registered via setConnectionEventCb().
+   * registered via addConnectionCallbacks().
    */
   virtual void connect() PURE;
 };

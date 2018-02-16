@@ -1,3 +1,4 @@
+#include "envoy/api/v2/eds.pb.h"
 #include "envoy/http/async_client.h"
 
 #include "common/common/utility.h"
@@ -13,7 +14,6 @@
 #include "test/mocks/upstream/mocks.h"
 #include "test/test_common/utility.h"
 
-#include "api/eds.pb.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -92,8 +92,8 @@ public:
     timer_cb_();
   }
 
-  void deliverConfigUpdate(const std::vector<std::string> cluster_names, const std::string& version,
-                           bool accept) override {
+  void deliverConfigUpdate(const std::vector<std::string>& cluster_names,
+                           const std::string& version, bool accept) override {
     std::string response_json = "{\"version_info\":\"" + version + "\",\"resources\":[";
     for (const auto& cluster : cluster_names) {
       response_json += "{\"@type\":\"type.googleapis.com/"
@@ -139,7 +139,7 @@ public:
   Event::MockDispatcher dispatcher_;
   Event::MockTimer* timer_;
   Event::TimerCb timer_cb_;
-  envoy::api::v2::Node node_;
+  envoy::api::v2::core::Node node_;
   Runtime::MockRandomGenerator random_gen_;
   Http::MockAsyncClientRequest http_request_;
   Http::AsyncClient::Callbacks* http_callbacks_;

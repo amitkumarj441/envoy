@@ -1,8 +1,8 @@
 #pragma once
 
-#include "common/common/logger.h"
+#include <backward.hpp>
 
-#include "backward.hpp"
+#include "common/common/logger.h"
 
 namespace Envoy {
 #define BACKTRACE_LOG()                                                                            \
@@ -14,7 +14,7 @@ namespace Envoy {
 
 /**
  * Use the Backward library ( https://github.com/bombela/backward-cpp ) to log
- * stack traces on demand.  To use this just do:
+ * stack traces on demand. To use this just do:
  *
  * BackwardsTrace tracer;
  * tracer.capture(); // Trace is captured as of here.
@@ -29,11 +29,11 @@ namespace Envoy {
  *
  * To resolve the addresses in the backtrace output and de-interleave
  * multithreaded output use the tools/stack_decode.py command and pass the
- * log/stderr output to stdin of the tool.  Backtrace lines will be resolved,
+ * log/stderr output to stdin of the tool. Backtrace lines will be resolved,
  * other lines will be passed through and echo'd unchanged.
  *
  * The stack_decode.py tool can also run envoy or a test as a child process if
- * you pass the command and arguments as arguments to the tool.  This enables
+ * you pass the command and arguments as arguments to the tool. This enables
  * you to run tests containing backtrace commands added for debugging and see
  * the output like this:
  *
@@ -81,8 +81,14 @@ public:
     backward::ResolvedTrace first_frame_trace = resolver.resolve(stack_trace_[0]);
     auto obj_name = first_frame_trace.object_filename;
 
+#ifdef __APPLE__
+    // The stack_decode.py script uses addr2line which isn't readily available and doesn't seem to
+    // work when installed.
+    ENVOY_LOG(critical, "Backtrace obj<{}> thr<{}>:", obj_name, thread_id);
+#else
     ENVOY_LOG(critical, "Backtrace obj<{}> thr<{}> (use tools/stack_decode.py):", obj_name,
               thread_id);
+#endif
 
     // Backtrace gets tagged by ASAN when we try the object name resolution for the last
     // frame on stack, so skip the last one. It has no useful info anyway.
@@ -92,7 +98,14 @@ public:
         obj_name = trace.object_filename;
         ENVOY_LOG(critical, "thr<{}> obj<{}>", thread_id, obj_name);
       }
+
+#ifdef __APPLE__
+      // In the absence of stack_decode.py, print the function name.
+      ENVOY_LOG(critical, "thr<{}> #{} {}: {}", thread_id, stack_trace_[i].idx,
+                stack_trace_[i].addr, trace.object_function);
+#else
       ENVOY_LOG(critical, "thr<{}> #{} {}", thread_id, stack_trace_[i].idx, stack_trace_[i].addr);
+#endif
     }
     ENVOY_LOG(critical, "end backtrace thread {}", stack_trace_.thread_id());
   }

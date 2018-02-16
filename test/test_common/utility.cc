@@ -15,6 +15,8 @@
 #include "envoy/http/codec.h"
 
 #include "common/common/empty_string.h"
+#include "common/common/fmt.h"
+#include "common/common/utility.h"
 #include "common/config/bootstrap_json.h"
 #include "common/json/json_loader.h"
 #include "common/network/address_impl.h"
@@ -22,7 +24,7 @@
 
 #include "test/test_common/printers.h"
 
-#include "fmt/format.h"
+#include "absl/strings/string_view.h"
 #include "gtest/gtest.h"
 
 using testing::GTEST_FLAG(random_seed);
@@ -80,6 +82,18 @@ std::string TestUtility::bufferToString(const Buffer::Instance& buffer) {
   return output;
 }
 
+void TestUtility::feedBufferWithRandomCharacters(Buffer::Instance& buffer, uint64_t n_char,
+                                                 uint64_t seed) {
+  const std::string sample = "Neque porro quisquam est qui dolorem ipsum..";
+  std::mt19937 generate(seed);
+  std::uniform_int_distribution<> distribute(1, sample.length() - 1);
+  std::string str{};
+  for (uint64_t n = 0; n < n_char; ++n) {
+    str += sample.at(distribute(generate));
+  }
+  buffer.add(str);
+}
+
 Stats::CounterSharedPtr TestUtility::findCounter(Stats::Store& store, const std::string& name) {
   for (auto counter : store.counters()) {
     if (counter->name() == name) {
@@ -117,12 +131,16 @@ std::vector<std::string> TestUtility::listFiles(const std::string& path, bool re
   dirent* entry;
   while ((entry = readdir(dir)) != nullptr) {
     std::string file_name = fmt::format("{}/{}", path, std::string(entry->d_name));
-    if (recursive && entry->d_type == DT_DIR && std::string(entry->d_name) != "." &&
+    struct stat stat_result;
+    int rc = ::stat(file_name.c_str(), &stat_result);
+    EXPECT_EQ(rc, 0);
+
+    if (recursive && S_ISDIR(stat_result.st_mode) && std::string(entry->d_name) != "." &&
         std::string(entry->d_name) != "..") {
       std::vector<std::string> more_file_names = listFiles(file_name, recursive);
       file_names.insert(file_names.end(), more_file_names.begin(), more_file_names.end());
       continue;
-    } else if (entry->d_type == DT_DIR) {
+    } else if (S_ISDIR(stat_result.st_mode)) {
       continue;
     }
 
@@ -133,11 +151,25 @@ std::vector<std::string> TestUtility::listFiles(const std::string& path, bool re
   return file_names;
 }
 
-envoy::api::v2::Bootstrap TestUtility::parseBootstrapFromJson(const std::string& json_string) {
-  envoy::api::v2::Bootstrap bootstrap;
+envoy::config::bootstrap::v2::Bootstrap
+TestUtility::parseBootstrapFromJson(const std::string& json_string) {
+  envoy::config::bootstrap::v2::Bootstrap bootstrap;
   auto json_object_ptr = Json::Factory::loadFromString(json_string);
   Config::BootstrapJson::translateBootstrap(*json_object_ptr, bootstrap);
   return bootstrap;
+}
+
+std::vector<std::string> TestUtility::split(const std::string& source, char split) {
+  return TestUtility::split(source, std::string{split});
+}
+
+std::vector<std::string> TestUtility::split(const std::string& source, const std::string& split,
+                                            bool keep_empty_string) {
+  std::vector<std::string> ret;
+  const auto tokens_sv = StringUtil::splitToken(source, split, keep_empty_string);
+  std::transform(tokens_sv.begin(), tokens_sv.end(), std::back_inserter(ret),
+                 [](absl::string_view sv) { return std::string(sv); });
+  return ret;
 }
 
 void ConditionalInitializer::setReady() {

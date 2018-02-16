@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_set>
 
+#include "envoy/config/bootstrap/v2//bootstrap.pb.validate.h"
+#include "envoy/config/bootstrap/v2/bootstrap.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/signal.h"
 #include "envoy/event/timer.h"
@@ -14,9 +17,11 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/api/api_impl.h"
+#include "common/api/os_sys_calls_impl.h"
 #include "common/common/utility.h"
 #include "common/common/version.h"
 #include "common/config/bootstrap_json.h"
+#include "common/config/utility.h"
 #include "common/local_info/local_info_impl.h"
 #include "common/memory/stats.h"
 #include "common/network/address_impl.h"
@@ -24,14 +29,13 @@
 #include "common/router/rds_impl.h"
 #include "common/runtime/runtime_impl.h"
 #include "common/singleton/manager_impl.h"
+#include "common/stats/thread_local_store.h"
 #include "common/upstream/cluster_manager_impl.h"
 
 #include "server/configuration_impl.h"
 #include "server/connection_handler_impl.h"
 #include "server/guarddog_impl.h"
 #include "server/test_hooks.h"
-
-#include "api/bootstrap.pb.h"
 
 namespace Envoy {
 namespace Server {
@@ -41,53 +45,57 @@ InstanceImpl::InstanceImpl(Options& options, Network::Address::InstanceConstShar
                            Thread::BasicLockable& access_log_lock,
                            ComponentFactory& component_factory, ThreadLocal::Instance& tls)
     : options_(options), restarter_(restarter), start_time_(time(nullptr)),
-      original_start_time_(start_time_),
-      stats_store_(store), server_stats_{ALL_SERVER_STATS(
-                               POOL_GAUGE_PREFIX(stats_store_, "server."))},
-      thread_local_(tls), api_(new Api::Impl(options.fileFlushIntervalMsec())),
-      dispatcher_(api_->allocateDispatcher()), singleton_manager_(new Singleton::ManagerImpl()),
+      original_start_time_(start_time_), stats_store_(store), thread_local_(tls),
+      api_(new Api::Impl(options.fileFlushIntervalMsec())), dispatcher_(api_->allocateDispatcher()),
+      singleton_manager_(new Singleton::ManagerImpl()),
       handler_(new ConnectionHandlerImpl(ENVOY_LOGGER(), *dispatcher_)),
       listener_component_factory_(*this), worker_factory_(thread_local_, *api_, hooks),
       dns_resolver_(dispatcher_->createDnsResolver({})),
-      access_log_manager_(*api_, *dispatcher_, access_log_lock, store) {
-
-  failHealthcheck(false);
-
-  uint64_t version_int;
-  if (!StringUtil::atoul(VersionInfo::revision().substr(0, 6).c_str(), version_int, 16)) {
-    throw EnvoyException("compiled GIT SHA is invalid. Invalid build.");
-  }
-  server_stats_.version_.set(version_int);
-
-  restarter_.initialize(*dispatcher_, *this);
-  drain_manager_ = component_factory.createDrainManager(*this);
+      access_log_manager_(*api_, *dispatcher_, access_log_lock, store), terminated_(false) {
 
   try {
+    if (!options.logPath().empty()) {
+      try {
+        Logger::Registry::getSink()->logToFile(options.logPath(), access_log_manager_);
+      } catch (const EnvoyException& e) {
+        throw EnvoyException(
+            fmt::format("Failed to open log-file '{}'. e.what(): {}", options.logPath(), e.what()));
+      }
+    }
+
+    restarter_.initialize(*dispatcher_, *this);
+    drain_manager_ = component_factory.createDrainManager(*this);
     initialize(options, local_address, component_factory);
   } catch (const EnvoyException& e) {
     ENVOY_LOG(critical, "error initializing configuration '{}': {}", options.configPath(),
               e.what());
-    thread_local_.shutdownGlobalThreading();
-    thread_local_.shutdownThread();
-    exit(1);
+
+    terminate();
+    throw;
   }
 }
 
-InstanceImpl::~InstanceImpl() { restarter_.shutdown(); }
+InstanceImpl::~InstanceImpl() {
+  terminate();
+
+  // Stop logging to file before all the AccessLogManager and its dependencies are
+  // destructed to avoid crashing at shutdown.
+  Logger::Registry::getSink()->logToStdErr();
+}
 
 Upstream::ClusterManager& InstanceImpl::clusterManager() { return config_->clusterManager(); }
 
 Tracing::HttpTracer& InstanceImpl::httpTracer() { return config_->httpTracer(); }
 
 void InstanceImpl::drainListeners() {
-  ENVOY_LOG(warn, "closing and draining listeners");
+  ENVOY_LOG(info, "closing and draining listeners");
   listener_manager_->stopListeners();
   drain_manager_->startDrainSequence(nullptr);
 }
 
 void InstanceImpl::failHealthcheck(bool fail) {
   // We keep liveness state in shared memory so the parent process sees the same state.
-  server_stats_.live_.set(!fail);
+  server_stats_->live_.set(!fail);
 }
 
 void InstanceUtil::flushCountersAndGaugesToSinks(const std::list<Stats::SinkPtr>& sinks,
@@ -100,7 +108,7 @@ void InstanceUtil::flushCountersAndGaugesToSinks(const std::list<Stats::SinkPtr>
     uint64_t delta = counter->latch();
     if (counter->used()) {
       for (const auto& sink : sinks) {
-        sink->flushCounter(counter->name(), delta);
+        sink->flushCounter(*counter, delta);
       }
     }
   }
@@ -108,7 +116,7 @@ void InstanceUtil::flushCountersAndGaugesToSinks(const std::list<Stats::SinkPtr>
   for (const Stats::GaugeSharedPtr& gauge : store.gauges()) {
     if (gauge->used()) {
       for (const auto& sink : sinks) {
-        sink->flushGauge(gauge->name(), gauge->value());
+        sink->flushGauge(*gauge, gauge->value());
       }
     }
   }
@@ -122,13 +130,13 @@ void InstanceImpl::flushStats() {
   ENVOY_LOG(debug, "flushing stats");
   HotRestart::GetParentStatsInfo info;
   restarter_.getParentStats(info);
-  server_stats_.uptime_.set(time(nullptr) - original_start_time_);
-  server_stats_.memory_allocated_.set(Memory::Stats::totalCurrentlyAllocated() +
-                                      info.memory_allocated_);
-  server_stats_.memory_heap_size_.set(Memory::Stats::totalCurrentlyReserved());
-  server_stats_.parent_connections_.set(info.num_connections_);
-  server_stats_.total_connections_.set(numConnections() + info.num_connections_);
-  server_stats_.days_until_first_cert_expiring_.set(
+  server_stats_->uptime_.set(time(nullptr) - original_start_time_);
+  server_stats_->memory_allocated_.set(Memory::Stats::totalCurrentlyAllocated() +
+                                       info.memory_allocated_);
+  server_stats_->memory_heap_size_.set(Memory::Stats::totalCurrentlyReserved());
+  server_stats_->parent_connections_.set(info.num_connections_);
+  server_stats_->total_connections_.set(numConnections() + info.num_connections_);
+  server_stats_->days_until_first_cert_expiring_.set(
       sslContextManager().daysUntilFirstCertExpires());
 
   InstanceUtil::flushCountersAndGaugesToSinks(config_->statsSinks(), stats_store_);
@@ -140,26 +148,54 @@ void InstanceImpl::getParentStats(HotRestart::GetParentStatsInfo& info) {
   info.num_connections_ = numConnections();
 }
 
-bool InstanceImpl::healthCheckFailed() { return server_stats_.live_.value() == 0; }
+bool InstanceImpl::healthCheckFailed() { return server_stats_->live_.value() == 0; }
+
+void InstanceUtil::loadBootstrapConfig(envoy::config::bootstrap::v2::Bootstrap& bootstrap,
+                                       const std::string& config_path, bool v2_only) {
+  bool v2_config_loaded = false;
+  try {
+    MessageUtil::loadFromFileAndValidate(config_path, bootstrap);
+    v2_config_loaded = true;
+  } catch (const EnvoyException& e) {
+    if (v2_only) {
+      throw;
+    } else {
+      // TODO(htuch): When v1 is deprecated, make this a warning encouraging config upgrade.
+      ENVOY_LOG(debug, "Unable to initialize config as v2, will retry as v1: {}", e.what());
+    }
+  }
+  if (!v2_config_loaded) {
+    Json::ObjectSharedPtr config_json = Json::Factory::loadFromFile(config_path);
+    Config::BootstrapJson::translateBootstrap(*config_json, bootstrap);
+    MessageUtil::validate(bootstrap);
+  }
+}
 
 void InstanceImpl::initialize(Options& options,
                               Network::Address::InstanceConstSharedPtr local_address,
                               ComponentFactory& component_factory) {
-  ENVOY_LOG(warn, "initializing epoch {} (hot restart version={})", options.restartEpoch(),
+  ENVOY_LOG(info, "initializing epoch {} (hot restart version={})", options.restartEpoch(),
             restarter_.version());
 
   // Handle configuration that needs to take place prior to the main configuration load.
-  envoy::api::v2::Bootstrap bootstrap;
-  try {
-    MessageUtil::loadFromFile(options.configPath(), bootstrap);
-  } catch (const EnvoyException& e) {
-    // TODO(htuch): When v1 is deprecated, make this a warning encouraging config upgrade.
-    ENVOY_LOG(debug, "Unable to initialize config as v2, will retry as v1: {}", e.what());
+  envoy::config::bootstrap::v2::Bootstrap bootstrap;
+  InstanceUtil::loadBootstrapConfig(bootstrap, options.configPath(), options.v2ConfigOnly());
+
+  // Needs to happen as early as possible in the instantiation to preempt the objects that require
+  // stats.
+  stats_store_.setTagProducer(Config::Utility::createTagProducer(bootstrap));
+
+  server_stats_.reset(
+      new ServerStats{ALL_SERVER_STATS(POOL_GAUGE_PREFIX(stats_store_, "server."))});
+
+  failHealthcheck(false);
+
+  uint64_t version_int;
+  if (!StringUtil::atoul(VersionInfo::revision().substr(0, 6).c_str(), version_int, 16)) {
+    throw EnvoyException("compiled GIT SHA is invalid. Invalid build.");
   }
-  if (!bootstrap.has_admin()) {
-    Json::ObjectSharedPtr config_json = Json::Factory::loadFromFile(options.configPath());
-    Config::BootstrapJson::translateBootstrap(*config_json, bootstrap);
-  }
+
+  server_stats_->version_.set(version_int);
   bootstrap.mutable_node()->set_build_version(VersionInfo::version());
 
   local_info_.reset(
@@ -167,7 +203,7 @@ void InstanceImpl::initialize(Options& options,
                                    options.serviceClusterName(), options.serviceNodeName()));
 
   Configuration::InitialImpl initial_config(bootstrap);
-  ENVOY_LOG(info, "admin address: {}", initial_config.admin().address()->asString());
+  ENVOY_LOG(debug, "admin address: {}", initial_config.admin().address()->asString());
 
   HotRestart::ShutdownParentAdminInfo info;
   info.original_start_time_ = original_start_time_;
@@ -175,11 +211,9 @@ void InstanceImpl::initialize(Options& options,
   original_start_time_ = info.original_start_time_;
   admin_.reset(new AdminImpl(initial_config.admin().accessLogPath(),
                              initial_config.admin().profilePath(), options.adminAddressPath(),
-                             initial_config.admin().address(), *this));
-
-  admin_scope_ = stats_store_.createScope("listener.admin.");
-  handler_->addListener(*admin_, admin_->mutable_socket(), *admin_scope_, 0,
-                        Network::ListenerOptions::listenerOptionsWithBindToPort());
+                             initial_config.admin().address(), *this,
+                             stats_store_.createScope("listener.admin.")));
+  handler_->addListener(admin_->listener());
 
   loadServerFlags(initial_config.flagsPath());
 
@@ -245,9 +279,11 @@ Runtime::LoaderPtr InstanceUtil::createRuntime(Instance& server,
         config.runtime()->overrideSubdirectory() + "/" + server.localInfo().clusterName();
     ENVOY_LOG(info, "runtime override subdirectory: {}", override_subdirectory);
 
+    Api::OsSysCallsPtr os_sys_calls(new Api::OsSysCallsImpl);
     return Runtime::LoaderPtr{new Runtime::LoaderImpl(
         server.dispatcher(), server.threadLocal(), config.runtime()->symlinkRoot(),
-        config.runtime()->subdirectory(), override_subdirectory, server.stats(), server.random())};
+        config.runtime()->subdirectory(), override_subdirectory, server.stats(), server.random(),
+        std::move(os_sys_calls))};
   } else {
     return Runtime::LoaderPtr{new Runtime::NullLoaderImpl(server.random())};
   }
@@ -260,7 +296,7 @@ void InstanceImpl::loadServerFlags(const Optional<std::string>& flags_path) {
 
   ENVOY_LOG(info, "server flags path: {}", flags_path.value());
   if (api_->fileExists(flags_path.value() + "/drain")) {
-    ENVOY_LOG(warn, "starting server in drain mode");
+    ENVOY_LOG(info, "starting server in drain mode");
     failHealthcheck(true);
   }
 }
@@ -298,7 +334,7 @@ RunHelper::RunHelper(Event::Dispatcher& dispatcher, Upstream::ClusterManager& cm
       return;
     }
 
-    ENVOY_LOG(warn, "all clusters initialized. initializing init manager");
+    ENVOY_LOG(info, "all clusters initialized. initializing init manager");
     init_manager.initialize([this, workers_start_cb]() {
       if (shutdown_) {
         return;
@@ -314,13 +350,22 @@ void InstanceImpl::run() {
                    [this]() -> void { startWorkers(); });
 
   // Run the main dispatch loop waiting to exit.
-  ENVOY_LOG(warn, "starting main dispatch loop");
+  ENVOY_LOG(info, "starting main dispatch loop");
   auto watchdog = guard_dog_->createWatchDog(Thread::Thread::currentThreadId());
   watchdog->startWatchdog(*dispatcher_);
   dispatcher_->run(Event::Dispatcher::RunType::Block);
-  ENVOY_LOG(warn, "main dispatch loop exited");
+  ENVOY_LOG(info, "main dispatch loop exited");
   guard_dog_->stopWatching(watchdog);
   watchdog.reset();
+
+  terminate();
+}
+
+void InstanceImpl::terminate() {
+  if (terminated_) {
+    return;
+  }
+  terminated_ = true;
 
   // Before starting to shutdown anything else, stop slot destruction updates.
   thread_local_.shutdownGlobalThreading();
@@ -329,24 +374,29 @@ void InstanceImpl::run() {
   stats_store_.shutdownThreading();
 
   // Shutdown all the workers now that the main dispatch loop is done.
-  listener_manager_->stopWorkers();
+  if (listener_manager_.get() != nullptr) {
+    listener_manager_->stopWorkers();
+  }
 
   // Only flush if we have not been hot restarted.
   if (stat_flush_timer_) {
     flushStats();
   }
 
-  config_->clusterManager().shutdown();
+  if (config_.get() != nullptr) {
+    config_->clusterManager().shutdown();
+  }
   handler_.reset();
   thread_local_.shutdownThread();
-  ENVOY_LOG(warn, "exiting");
+  restarter_.shutdown();
+  ENVOY_LOG(info, "exiting");
   ENVOY_FLUSH_LOG();
 }
 
 Runtime::Loader& InstanceImpl::runtime() { return *runtime_loader_; }
 
 void InstanceImpl::shutdown() {
-  ENVOY_LOG(warn, "shutdown invoked. sending SIGTERM to self");
+  ENVOY_LOG(info, "shutdown invoked. sending SIGTERM to self");
   kill(getpid(), SIGTERM);
 }
 

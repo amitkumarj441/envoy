@@ -1,5 +1,7 @@
 #pragma once
 
+#include <http_parser.h>
+
 #include <array>
 #include <cstdint>
 #include <list>
@@ -16,8 +18,6 @@
 #include "common/http/codes.h"
 #include "common/http/header_map_impl.h"
 
-#include "http_parser.h"
-
 namespace Envoy {
 namespace Http {
 namespace Http1 {
@@ -33,6 +33,7 @@ class StreamEncoderImpl : public StreamEncoder,
                           public StreamCallbackHelper {
 public:
   // Http::StreamEncoder
+  void encode100ContinueHeaders(const HeaderMap& headers) override;
   void encodeHeaders(const HeaderMap& headers, bool end_stream) override;
   void encodeData(Buffer::Instance& data, bool end_stream) override;
   void encodeTrailers(const HeaderMap& trailers) override;
@@ -69,6 +70,7 @@ private:
   void endEncode();
 
   bool chunk_encoding_{true};
+  bool processing_100_continue_{false};
 };
 
 /**
@@ -340,6 +342,8 @@ private:
 
   std::unique_ptr<RequestStreamEncoderImpl> request_encoder_;
   std::list<PendingResponse> pending_responses_;
+  // Set true between receiving 100-Continue headers and receiving the spurious onMessageComplete.
+  bool ignore_message_complete_for_100_continue_{};
 };
 
 } // namespace Http1

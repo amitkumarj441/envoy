@@ -41,6 +41,7 @@ envoy_cc_test(
         "//include/envoy/event:dispatcher_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:empty_string",
+        "//source/common/config:filter_json_lib",
         "//source/common/http:header_map_lib",
         "//source/common/http:headers_lib",
         "//source/common/http/filter:fault_filter_lib",
@@ -49,6 +50,18 @@ envoy_cc_test(
         "//test/mocks/http:http_mocks",
         "//test/mocks/runtime:runtime_mocks",
         "//test/mocks/upstream:upstream_mocks",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "gzip_filter_test",
+    srcs = ["gzip_filter_test.cc"],
+    deps = [
+        "//source/common/compressor:compressor_lib",
+        "//source/common/decompressor:decompressor_lib",
+        "//source/common/http/filter:gzip_filter_lib",
+        "//source/common/protobuf:utility_lib",
         "//test/test_common:utility_lib",
     ],
 )
@@ -74,6 +87,7 @@ envoy_cc_test(
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/common/common:empty_string",
+        "//source/common/config:filter_json_lib",
         "//source/common/http:headers_lib",
         "//source/common/http/filter:ratelimit_includes",
         "//source/common/http/filter:ratelimit_lib",
@@ -85,5 +99,20 @@ envoy_cc_test(
         "//test/mocks/tracing:tracing_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "squash_filter_test",
+    srcs = ["squash_filter_test.cc"],
+    deps = [
+        "//include/envoy/event:dispatcher_interface",
+        "//source/common/http:header_map_lib",
+        "//source/common/http/filter:squash_filter_lib",
+        "//source/common/stats:stats_lib",
+        "//source/server/config/http:squash_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/server:server_mocks",
+        "//test/mocks/upstream:upstream_mocks",
     ],
 )

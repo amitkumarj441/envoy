@@ -12,22 +12,42 @@ load(
 envoy_package()
 
 envoy_cc_test(
+    name = "access_log_integration_test",
+    srcs = ["access_log_integration_test.cc"],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/buffer:zero_copy_input_stream_lib",
+        "//source/common/grpc:codec_lib",
+        "//source/common/grpc:common_lib",
+        "//test/common/grpc:grpc_client_integration_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "ads_integration_test",
     srcs = ["ads_integration_test.cc"],
-    data = ["//test/config/integration:server_ads.yaml"],
-    external_deps = [
-        "envoy_cds",
-        "envoy_discovery",
-        "envoy_eds",
-        "envoy_lds",
-        "envoy_rds",
+    data = [
+        "//test/config/integration:server_ads.yaml",
+        "//test/config/integration/certs",
     ],
     deps = [
         ":http_integration_lib",
+        "//source/common/config:protobuf_link_hacks",
         "//source/common/config:resources_lib",
         "//source/common/protobuf:utility_lib",
+        "//source/common/ssl:context_config_lib",
+        "//source/common/ssl:context_lib",
+        "//source/common/ssl:ssl_socket_lib",
+        "//test/common/grpc:grpc_client_integration_lib",
+        "//test/mocks/runtime:runtime_mocks",
         "//test/test_common:network_utility_lib",
         "//test/test_common:utility_lib",
+        "@envoy_api//envoy/api/v2:cds_cc",
+        "@envoy_api//envoy/api/v2:discovery_cc",
+        "@envoy_api//envoy/api/v2:eds_cc",
+        "@envoy_api//envoy/api/v2:lds_cc",
+        "@envoy_api//envoy/api/v2:rds_cc",
+        "@envoy_api//envoy/service/discovery/v2:ads_cc",
     ],
 )
 
@@ -41,7 +61,6 @@ envoy_cc_test(
         "//test/config/integration:server_http2.json",
         "//test/config/integration:server_http2_upstream.json",
         "//test/config/integration:server_proxy_proto.json",
-        "//test/config/integration:server_ratelimit.json",
         "//test/config/integration:server_ssl.json",
         "//test/config/integration:server_uds.json",
         "//test/config/integration:server_xfcc.json",
@@ -51,18 +70,6 @@ envoy_cc_test(
     ],
     deps = [
         ":integration_lib",
-        "//source/common/http:header_map_lib",
-        "//source/common/protobuf:utility_lib",
-        "//test/test_common:network_utility_lib",
-        "//test/test_common:utility_lib",
-    ],
-)
-
-envoy_cc_test(
-    name = "proto_integration_test",
-    srcs = ["proto_integration_test.cc"],
-    deps = [
-        ":http_integration_lib",
         "//source/common/http:header_map_lib",
         "//source/common/protobuf:utility_lib",
         "//test/test_common:network_utility_lib",
@@ -80,12 +87,6 @@ envoy_sh_test(
         "//test/config/integration:server_config_files",
         "//tools:socket_passing",
     ],
-    # Need to disable test execution sandboxing for this test, since it uses shmem.
-    # TODO(htuch): When most folks are using a Bazel with the recent
-    # https://github.com/bazelbuild/bazel/commit/8d739f2fad3fd0135b940170691b0119c5baca1e,
-    # we should be able to remove this workaround. See the various issues closed in the commit
-    # message for further details.
-    local = 1,
 )
 
 envoy_cc_test(
@@ -103,6 +104,18 @@ envoy_cc_test(
         "//test/mocks/http:http_mocks",
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "header_integration_test",
+    srcs = [
+        "header_integration_test.cc",
+    ],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/protobuf",
+        "@envoy_api//envoy/config/filter/network/http_connection_manager/v2:http_connection_manager_cc",
     ],
 )
 
@@ -127,6 +140,16 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "lua_integration_test",
+    srcs = [
+        "lua_integration_test.cc",
+    ],
+    deps = [
+        ":http_integration_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "http2_upstream_integration_test",
     srcs = [
         "http2_upstream_integration_test.cc",
@@ -137,6 +160,17 @@ envoy_cc_test(
         ":http_integration_lib",
         "//source/common/http:header_map_lib",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "gzip_filter_integration_test",
+    srcs = [
+        "gzip_filter_integration_test.cc",
+    ],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/decompressor:decompressor_lib",
     ],
 )
 
@@ -191,6 +225,7 @@ envoy_cc_test_library(
 envoy_cc_test_library(
     name = "integration_lib",
     srcs = [
+        "autonomous_upstream.cc",
         "fake_upstream.cc",
         "integration.cc",
         "server.cc",
@@ -198,6 +233,7 @@ envoy_cc_test_library(
         "utility.cc",
     ],
     hdrs = [
+        "autonomous_upstream.h",
         "fake_upstream.h",
         "integration.h",
         "server.h",
@@ -223,6 +259,7 @@ envoy_cc_test_library(
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
         "//source/common/common:thread_lib",
+        "//source/common/event:dispatcher_lib",
         "//source/common/grpc:codec_lib",
         "//source/common/grpc:common_lib",
         "//source/common/http:codec_client_lib",
@@ -242,15 +279,18 @@ envoy_cc_test_library(
         "//source/server:hot_restart_nop_lib",
         "//source/server:server_lib",
         "//source/server:test_hooks_lib",
+        "//source/server/config/access_log:file_access_log_lib",
+        "//source/server/config/access_log:grpc_access_log_lib",
         "//source/server/config/http:buffer_lib",
         "//source/server/config/http:cors_lib",
         "//source/server/config/http:dynamo_lib",
         "//source/server/config/http:fault_lib",
-        "//source/server/config/http:file_access_log_lib",
         "//source/server/config/http:grpc_http1_bridge_lib",
         "//source/server/config/http:grpc_json_transcoder_lib",
+        "//source/server/config/http:gzip_lib",
         "//source/server/config/http:ip_tagging_lib",
         "//source/server/config/http:lightstep_lib",
+        "//source/server/config/http:lua_lib",
         "//source/server/config/http:ratelimit_lib",
         "//source/server/config/http:router_lib",
         "//source/server/config/http:zipkin_lib",
@@ -259,7 +299,9 @@ envoy_cc_test_library(
         "//source/server/config/network:http_connection_manager_lib",
         "//source/server/config/network:mongo_proxy_lib",
         "//source/server/config/network:ratelimit_lib",
+        "//source/server/config/network:raw_buffer_socket_lib",
         "//source/server/config/network:redis_proxy_lib",
+        "//source/server/config/network:ssl_socket_lib",
         "//source/server/config/network:tcp_proxy_lib",
         "//source/server/config/stats:statsd_lib",
         "//source/server/http:health_check_lib",
@@ -307,6 +349,42 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "stats_integration_test",
+    srcs = ["stats_integration_test.cc"],
+    deps = [
+        ":integration_lib",
+        "//test/test_common:network_utility_lib",
+        "@envoy_api//envoy/config/bootstrap/v2:bootstrap_cc",
+        "@envoy_api//envoy/config/metrics/v2:stats_cc",
+    ],
+)
+
+envoy_cc_test(
+    name = "load_stats_integration_test",
+    srcs = ["load_stats_integration_test.cc"],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/config:resources_lib",
+        "//test/test_common:network_utility_lib",
+        "@envoy_api//envoy/api/v2:eds_cc",
+    ],
+)
+
+envoy_cc_test(
+    name = "metrics_service_integration_test",
+    srcs = ["metrics_service_integration_test.cc"],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/buffer:zero_copy_input_stream_lib",
+        "//source/common/grpc:codec_lib",
+        "//source/common/grpc:common_lib",
+        "//source/server/config/stats:metrics_service_lib",
+        "//test/common/grpc:grpc_client_integration_lib",
+        "@envoy_api//envoy/service/metrics/v2:metrics_service_cc",
+    ],
+)
+
+envoy_cc_test(
     name = "proxy_proto_integration_test",
     srcs = [
         "proxy_proto_integration_test.cc",
@@ -324,13 +402,13 @@ envoy_cc_test(
 envoy_cc_test(
     name = "ratelimit_integration_test",
     srcs = ["ratelimit_integration_test.cc"],
-    data = ["//test/config/integration:server_ratelimit.json"],
     deps = [
         ":http_integration_lib",
         "//source/common/buffer:zero_copy_input_stream_lib",
         "//source/common/grpc:codec_lib",
         "//source/common/grpc:common_lib",
         "//source/common/ratelimit:ratelimit_proto",
+        "//test/common/grpc:grpc_client_integration_lib",
     ],
 )
 
@@ -417,6 +495,21 @@ envoy_cc_test(
     deps = [
         ":http_integration_lib",
         "//source/common/http:header_map_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "squash_filter_integration_test",
+    srcs = [
+        "squash_filter_integration_test.cc",
+    ],
+    deps = [
+        ":http_integration_lib",
+        "//source/common/http:header_map_lib",
+        "//source/server/config/http:squash_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:utility_lib",
     ],
 )

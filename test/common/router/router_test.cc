@@ -3,6 +3,7 @@
 #include <string>
 
 #include "common/buffer/buffer_impl.h"
+#include "common/common/empty_string.h"
 #include "common/network/utility.h"
 #include "common/router/router.h"
 #include "common/upstream/upstream_impl.h"
@@ -10,19 +11,26 @@
 #include "test/common/http/common.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/local_info/mocks.h"
+#include "test/mocks/network/mocks.h"
 #include "test/mocks/router/mocks.h"
 #include "test/mocks/runtime/mocks.h"
 #include "test/mocks/ssl/mocks.h"
 #include "test/mocks/upstream/mocks.h"
+#include "test/test_common/environment.h"
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
+using testing::AssertionFailure;
+using testing::AssertionResult;
+using testing::AssertionSuccess;
 using testing::AtLeast;
 using testing::Invoke;
+using testing::MockFunction;
 using testing::NiceMock;
+using testing::Ref;
 using testing::Return;
 using testing::ReturnRef;
 using testing::SaveArg;
@@ -43,20 +51,29 @@ public:
     return RetryStatePtr{retry_state_};
   }
 
+  const Network::Connection* downstreamConnection() const override {
+    return &downstream_connection_;
+  }
+
+  NiceMock<Network::MockConnection> downstream_connection_;
   MockRetryState* retry_state_{};
 };
 
-class RouterTest : public testing::Test {
+class RouterTestBase : public testing::Test {
 public:
-  RouterTest()
+  RouterTestBase(bool start_child_span)
       : shadow_writer_(new MockShadowWriter()),
         config_("test.", local_info_, stats_store_, cm_, runtime_, random_,
-                ShadowWriterPtr{shadow_writer_}, true),
+                ShadowWriterPtr{shadow_writer_}, true, start_child_span),
         router_(config_) {
     router_.setDecoderFilterCallbacks(callbacks_);
+    upstream_locality_.set_zone("to_az");
 
     ON_CALL(*cm_.conn_pool_.host_, address()).WillByDefault(Return(host_address_));
-    ON_CALL(*cm_.conn_pool_.host_, zone()).WillByDefault(ReturnRef(upstream_zone_));
+    ON_CALL(*cm_.conn_pool_.host_, locality()).WillByDefault(ReturnRef(upstream_locality_));
+    router_.downstream_connection_.local_address_ = host_address_;
+    router_.downstream_connection_.remote_address_ =
+        Network::Utility::parseInternetAddressAndPort("1.2.3.4:80");
   }
 
   void expectResponseTimerCreate() {
@@ -71,7 +88,22 @@ public:
     EXPECT_CALL(*per_try_timeout_, disableTimer());
   }
 
+  AssertionResult verifyHostUpstreamStats(uint64_t success, uint64_t error) {
+    if (success != cm_.conn_pool_.host_->stats_store_.counter("rq_success").value()) {
+      return AssertionFailure() << fmt::format(
+                 "rq_success {} does not match expected {}",
+                 cm_.conn_pool_.host_->stats_store_.counter("rq_success").value(), success);
+    }
+    if (error != cm_.conn_pool_.host_->stats_store_.counter("rq_error").value()) {
+      return AssertionFailure() << fmt::format(
+                 "rq_error {} does not match expected {}",
+                 cm_.conn_pool_.host_->stats_store_.counter("rq_error").value(), error);
+    }
+    return AssertionSuccess();
+  }
+
   std::string upstream_zone_{"to_az"};
+  envoy::api::v2::core::Locality upstream_locality_;
   Stats::IsolatedStoreImpl stats_store_;
   NiceMock<Upstream::MockClusterManager> cm_;
   NiceMock<Runtime::MockLoader> runtime_;
@@ -88,9 +120,13 @@ public:
       Network::Utility::resolveUrl("tcp://10.0.0.5:9211")};
 };
 
+class RouterTest : public RouterTestBase {
+public:
+  RouterTest() : RouterTestBase(false) { EXPECT_CALL(callbacks_, activeSpan()).Times(0); }
+};
+
 TEST_F(RouterTest, RouteNotFound) {
-  EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::NoRouteFound));
+  EXPECT_CALL(callbacks_.request_info_, setResponseFlag(RequestInfo::ResponseFlag::NoRouteFound));
 
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
@@ -98,11 +134,11 @@ TEST_F(RouterTest, RouteNotFound) {
 
   router_.decodeHeaders(headers, true);
   EXPECT_EQ(1UL, stats_store_.counter("test.no_route").value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, ClusterNotFound) {
-  EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::NoRouteFound));
+  EXPECT_CALL(callbacks_.request_info_, setResponseFlag(RequestInfo::ResponseFlag::NoRouteFound));
 
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
@@ -110,12 +146,13 @@ TEST_F(RouterTest, ClusterNotFound) {
 
   router_.decodeHeaders(headers, true);
   EXPECT_EQ(1UL, stats_store_.counter("test.no_cluster").value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, PoolFailureWithPriority) {
   ON_CALL(callbacks_.route_->route_entry_, priority())
       .WillByDefault(Return(Upstream::ResourcePriority::High));
-  EXPECT_CALL(cm_, httpConnPoolForCluster(_, Upstream::ResourcePriority::High, &router_));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, Upstream::ResourcePriority::High, _, &router_));
 
   EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
       .WillOnce(Invoke([&](Http::StreamDecoder&, Http::ConnectionPool::Callbacks& callbacks)
@@ -130,7 +167,7 @@ TEST_F(RouterTest, PoolFailureWithPriority) {
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamConnectionFailure));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamConnectionFailure));
   EXPECT_CALL(callbacks_.request_info_, onUpstreamHostSelected(_))
       .WillOnce(Invoke([&](const Upstream::HostDescriptionConstSharedPtr host) -> void {
         EXPECT_EQ(host_address_, host->address());
@@ -139,18 +176,297 @@ TEST_F(RouterTest, PoolFailureWithPriority) {
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
   router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+TEST_F(RouterTest, Http1Upstream) {
+  EXPECT_CALL(*cm_.thread_local_cluster_.cluster_.info_, features());
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, Http::Protocol::Http11, _));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, Http2Upstream) {
+  EXPECT_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillOnce(Return(Upstream::ClusterInfo::Features::HTTP2));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, Http::Protocol::Http2, _));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, UseDownstreamProtocol1) {
+  Optional<Http::Protocol> downstream_protocol{Http::Protocol::Http11};
+  EXPECT_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillOnce(Return(Upstream::ClusterInfo::Features::USE_DOWNSTREAM_PROTOCOL));
+  EXPECT_CALL(callbacks_.request_info_, protocol()).WillOnce(ReturnRef(downstream_protocol));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, Http::Protocol::Http11, _));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, UseDownstreamProtocol2) {
+  Optional<Http::Protocol> downstream_protocol{Http::Protocol::Http2};
+  EXPECT_CALL(*cm_.thread_local_cluster_.cluster_.info_, features())
+      .WillOnce(Return(Upstream::ClusterInfo::Features::USE_DOWNSTREAM_PROTOCOL));
+  EXPECT_CALL(callbacks_.request_info_, protocol()).WillOnce(ReturnRef(downstream_protocol));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, Http::Protocol::Http2, _));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, HashPolicy) {
   ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
       .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
-  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_))
+  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_, _, _))
       .WillOnce(Return(Optional<uint64_t>(10)));
-  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _))
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
       .WillOnce(
-          Invoke([&](const std::string&, Upstream::ResourcePriority,
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
                      Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
-            EXPECT_EQ(10UL, context->hashKey().value());
+            EXPECT_EQ(10UL, context->computeHashKey().value());
+            return &cm_.conn_pool_;
+          }));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, HashPolicyNoHash) {
+  ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
+      .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
+  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_, _, _))
+      .WillOnce(Return(Optional<uint64_t>()));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, &router_))
+      .WillOnce(
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
+                     Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
+            EXPECT_EQ(false, context->computeHashKey().valid());
+            return &cm_.conn_pool_;
+          }));
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // When the router filter gets reset we should cancel the pool request.
+  EXPECT_CALL(cancellable_, cancel());
+  router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, AddCookie) {
+  ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
+      .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
+  NiceMock<Http::MockStreamEncoder> encoder;
+  Http::StreamDecoder* response_decoder = nullptr;
+
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder, cm_.conn_pool_.host_);
+        return &cancellable_;
+      }));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
+      .WillOnce(
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
+                     Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
+            EXPECT_EQ(10UL, context->computeHashKey().value());
+            return &cm_.conn_pool_;
+          }));
+
+  std::string cookie_value;
+  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_, _, _))
+      .WillOnce(Invoke([&](const std::string&, const Http::HeaderMap&,
+                           const HashPolicy::AddCookieCallback add_cookie) {
+        cookie_value = add_cookie("foo", std::chrono::seconds(1337));
+        return Optional<uint64_t>(10);
+      }));
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _))
+      .WillOnce(Invoke([&](const Http::HeaderMap& headers, const bool) -> void {
+        EXPECT_EQ(std::string{headers.get(Http::Headers::get().SetCookie)->value().c_str()},
+                  "foo=\"" + cookie_value + "\"; Max-Age=1337");
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  // When the router filter gets reset we should cancel the pool request.
+  router_.onDestroy();
+}
+
+TEST_F(RouterTest, AddCookieNoDuplicate) {
+  ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
+      .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
+  NiceMock<Http::MockStreamEncoder> encoder;
+  Http::StreamDecoder* response_decoder = nullptr;
+
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder, cm_.conn_pool_.host_);
+        return &cancellable_;
+      }));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
+      .WillOnce(
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
+                     Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
+            EXPECT_EQ(10UL, context->computeHashKey().value());
+            return &cm_.conn_pool_;
+          }));
+
+  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_, _, _))
+      .WillOnce(Invoke([&](const std::string&, const Http::HeaderMap&,
+                           const HashPolicy::AddCookieCallback add_cookie) {
+        // this should be ignored
+        add_cookie("foo", std::chrono::seconds(1337));
+        return Optional<uint64_t>(10);
+      }));
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _))
+      .WillOnce(Invoke([&](const Http::HeaderMap& headers, const bool) -> void {
+        EXPECT_STREQ(headers.get(Http::Headers::get().SetCookie)->value().c_str(), "foo=baz");
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"set-cookie", "foo=baz"}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  // When the router filter gets reset we should cancel the pool request.
+  router_.onDestroy();
+}
+
+TEST_F(RouterTest, AddMultipleCookies) {
+  ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
+      .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
+  NiceMock<Http::MockStreamEncoder> encoder;
+  Http::StreamDecoder* response_decoder = nullptr;
+
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder, cm_.conn_pool_.host_);
+        return &cancellable_;
+      }));
+
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
+      .WillOnce(
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
+                     Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
+            EXPECT_EQ(10UL, context->computeHashKey().value());
+            return &cm_.conn_pool_;
+          }));
+
+  std::string choco_c, foo_c;
+  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_, _, _))
+      .WillOnce(Invoke([&](const std::string&, const Http::HeaderMap&,
+                           const HashPolicy::AddCookieCallback add_cookie) {
+        choco_c = add_cookie("choco", std::chrono::seconds(15));
+        foo_c = add_cookie("foo", std::chrono::seconds(1337));
+        return Optional<uint64_t>(10);
+      }));
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _))
+      .WillOnce(Invoke([&](const Http::HeaderMap& headers, const bool) -> void {
+        MockFunction<void(const std::string&)> cb;
+        EXPECT_CALL(cb, Call("foo=\"" + foo_c + "\"; Max-Age=1337"));
+        EXPECT_CALL(cb, Call("choco=\"" + choco_c + "\"; Max-Age=15"));
+
+        headers.iterate(
+            [](const Http::HeaderEntry& header, void* context) -> Http::HeaderMap::Iterate {
+              if (header.key().c_str() == Http::Headers::get().SetCookie.get().c_str()) {
+                static_cast<MockFunction<void(const std::string&)>*>(context)->Call(
+                    std::string(header.value().c_str()));
+              }
+              return Http::HeaderMap::Iterate::Continue;
+            },
+            &cb);
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  router_.onDestroy();
+}
+
+TEST_F(RouterTest, MetadataMatchCriteria) {
+  MockMetadataMatchCriteria matches;
+
+  ON_CALL(callbacks_.route_->route_entry_, metadataMatchCriteria())
+      .WillByDefault(Return(&callbacks_.route_->route_entry_.metadata_matches_criteria_));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
+      .WillOnce(
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
+                     Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
+            EXPECT_EQ(context->metadataMatchCriteria(),
+                      &callbacks_.route_->route_entry_.metadata_matches_criteria_);
             return &cm_.conn_pool_;
           }));
   EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
@@ -165,16 +481,13 @@ TEST_F(RouterTest, HashPolicy) {
   router_.onDestroy();
 }
 
-TEST_F(RouterTest, HashPolicyNoHash) {
-  ON_CALL(callbacks_.route_->route_entry_, hashPolicy())
-      .WillByDefault(Return(&callbacks_.route_->route_entry_.hash_policy_));
-  EXPECT_CALL(callbacks_.route_->route_entry_.hash_policy_, generateHash(_))
-      .WillOnce(Return(Optional<uint64_t>()));
-  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, &router_))
+TEST_F(RouterTest, NoMetadataMatchCriteria) {
+  ON_CALL(callbacks_.route_->route_entry_, metadataMatchCriteria()).WillByDefault(Return(nullptr));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _))
       .WillOnce(
-          Invoke([&](const std::string&, Upstream::ResourcePriority,
+          Invoke([&](const std::string&, Upstream::ResourcePriority, Http::Protocol,
                      Upstream::LoadBalancerContext* context) -> Http::ConnectionPool::Instance* {
-            EXPECT_EQ(false, context->hashKey().valid());
+            EXPECT_EQ(context->metadataMatchCriteria(), nullptr);
             return &cm_.conn_pool_;
           }));
   EXPECT_CALL(cm_.conn_pool_, newStream(_, _)).WillOnce(Return(&cancellable_));
@@ -200,17 +513,18 @@ TEST_F(RouterTest, CancelBeforeBoundToPool) {
   // When the router filter gets reset we should cancel the pool request.
   EXPECT_CALL(cancellable_, cancel());
   router_.onDestroy();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, NoHost) {
-  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _)).WillOnce(Return(nullptr));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _)).WillOnce(Return(nullptr));
 
   Http::TestHeaderMapImpl response_headers{
       {":status", "503"}, {"content-length", "19"}, {"content-type", "text/plain"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::NoHealthyUpstream));
+              setResponseFlag(RequestInfo::ResponseFlag::NoHealthyUpstream));
 
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
@@ -218,23 +532,30 @@ TEST_F(RouterTest, NoHost) {
   EXPECT_EQ(0U, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                     .counter("upstream_rq_maintenance_mode")
                     .value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, MaintenanceMode) {
   EXPECT_CALL(*cm_.thread_local_cluster_.cluster_.info_, maintenanceMode()).WillOnce(Return(true));
 
-  Http::TestHeaderMapImpl response_headers{
-      {":status", "503"}, {"content-length", "16"}, {"content-type", "text/plain"}};
+  Http::TestHeaderMapImpl response_headers{{":status", "503"},
+                                           {"content-length", "16"},
+                                           {"content-type", "text/plain"},
+                                           {"x-envoy-overloaded", "true"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamOverflow));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamOverflow));
 
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
   router_.decodeHeaders(headers, true);
   EXPECT_EQ(1U, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                     .counter("upstream_rq_maintenance_mode")
+                    .value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  EXPECT_EQ(1U, cm_.thread_local_cluster_.cluster_.info_->load_report_stats_store_
+                    .counter("upstream_rq_dropped")
                     .value());
 }
 
@@ -259,6 +580,7 @@ TEST_F(RouterTest, NoRetriesOverflow) {
   Http::HeaderMapPtr response_headers1(new Http::TestHeaderMapImpl{{":status", "503"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // We expect the 5xx response to kick off a new request.
   EXPECT_CALL(encoder1.stream_, resetStream(_)).Times(0);
@@ -274,13 +596,14 @@ TEST_F(RouterTest, NoRetriesOverflow) {
 
   // RetryOverflow kicks in.
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamOverflow));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamOverflow));
   EXPECT_CALL(*router_.retry_state_, shouldRetry(_, _, _))
       .WillOnce(Return(RetryStatus::NoOverflow));
   EXPECT_CALL(cm_.conn_pool_.host_->health_checker_, setUnhealthy()).Times(0);
   Http::HeaderMapPtr response_headers2(new Http::TestHeaderMapImpl{{":status", "503"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers2), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 2));
 }
 
 TEST_F(RouterTest, ResetDuringEncodeHeaders) {
@@ -305,6 +628,7 @@ TEST_F(RouterTest, ResetDuringEncodeHeaders) {
   HttpTestUtility::addDefaultHeaders(headers);
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, UpstreamTimeout) {
@@ -331,7 +655,7 @@ TEST_F(RouterTest, UpstreamTimeout) {
   router_.decodeData(data, true);
 
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
   EXPECT_CALL(encoder.stream_, resetStream(Http::StreamResetReason::LocalReset));
   Http::TestHeaderMapImpl response_headers{
       {":status", "504"}, {"content-length", "24"}, {"content-type", "text/plain"}};
@@ -345,6 +669,185 @@ TEST_F(RouterTest, UpstreamTimeout) {
             cm_.thread_local_cluster_.cluster_.info_->stats_store_.counter("upstream_rq_timeout")
                 .value());
   EXPECT_EQ(1UL, cm_.conn_pool_.host_->stats().rq_timeout_.value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+// Validate gRPC OK response stats are sane when response is trailers only.
+TEST_F(RouterTest, GrpcOkTrailersOnly) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"grpc-status", "0"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
+}
+
+// Validate gRPC AlreadyExists response stats are sane when response is trailers only.
+TEST_F(RouterTest, GrpcAlreadyExistsTrailersOnly) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"grpc-status", "6"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
+}
+
+// Validate gRPC Internal response stats are sane when response is trailers only.
+TEST_F(RouterTest, GrpcInternalTrailersOnly) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"grpc-status", "13"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+// Validate gRPC response stats are sane when response is ended in a DATA
+// frame.
+TEST_F(RouterTest, GrpcDataEndStream) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), false);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  Buffer::OwnedImpl data;
+  response_decoder->decodeData(data, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+// Validate gRPC response stats are sane when response is reset after initial
+// response HEADERS.
+TEST_F(RouterTest, GrpcReset) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), false);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
+  encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+// Validate gRPC OK response stats are sane when response is not trailers only.
+TEST_F(RouterTest, GrpcOk) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), false);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  Http::HeaderMapPtr response_trailers(new Http::TestHeaderMapImpl{{"grpc-status", "0"}});
+  response_decoder->decodeTrailers(std::move(response_trailers));
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
+}
+
+// Validate gRPC Internal response stats are sane when response is not trailers only.
+TEST_F(RouterTest, GrpcInternal) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"content-type", "application/grpc"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
+  response_decoder->decodeHeaders(std::move(response_headers), false);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  Http::HeaderMapPtr response_trailers(new Http::TestHeaderMapImpl{{"grpc-status", "13"}});
+  response_decoder->decodeTrailers(std::move(response_trailers));
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, UpstreamTimeoutWithAltResponse) {
@@ -372,7 +875,7 @@ TEST_F(RouterTest, UpstreamTimeoutWithAltResponse) {
   router_.decodeData(data, true);
 
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
   EXPECT_CALL(encoder.stream_, resetStream(Http::StreamResetReason::LocalReset));
   Http::TestHeaderMapImpl response_headers{{":status", "204"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), true));
@@ -384,6 +887,7 @@ TEST_F(RouterTest, UpstreamTimeoutWithAltResponse) {
             cm_.thread_local_cluster_.cluster_.info_->stats_store_.counter("upstream_rq_timeout")
                 .value());
   EXPECT_EQ(1UL, cm_.conn_pool_.host_->stats().rq_timeout_.value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, UpstreamPerTryTimeout) {
@@ -412,7 +916,7 @@ TEST_F(RouterTest, UpstreamPerTryTimeout) {
   router_.decodeData(data, true);
 
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
   EXPECT_CALL(encoder.stream_, resetStream(Http::StreamResetReason::LocalReset));
   Http::TestHeaderMapImpl response_headers{
       {":status", "504"}, {"content-length", "24"}, {"content-type", "text/plain"}};
@@ -425,6 +929,7 @@ TEST_F(RouterTest, UpstreamPerTryTimeout) {
                     .counter("upstream_rq_per_try_timeout")
                     .value());
   EXPECT_EQ(1UL, cm_.conn_pool_.host_->stats().rq_timeout_.value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, PerTryTimeoutWithNoUpstreamHost) {
@@ -451,7 +956,7 @@ TEST_F(RouterTest, PerTryTimeoutWithNoUpstreamHost) {
 
   EXPECT_CALL(cancellable_, cancel());
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
   Http::TestHeaderMapImpl response_headers{
       {":status", "504"}, {"content-length", "24"}, {"content-type", "text/plain"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
@@ -462,6 +967,7 @@ TEST_F(RouterTest, PerTryTimeoutWithNoUpstreamHost) {
                     .counter("upstream_rq_per_try_timeout")
                     .value());
   EXPECT_EQ(0UL, cm_.conn_pool_.host_->stats().rq_timeout_.value());
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
 }
 
 TEST_F(RouterTest, RetryRequestNotComplete) {
@@ -475,7 +981,7 @@ TEST_F(RouterTest, RetryRequestNotComplete) {
         return nullptr;
       }));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRemoteReset));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRemoteReset));
   EXPECT_CALL(callbacks_.request_info_, onUpstreamHostSelected(_))
       .WillOnce(Invoke([&](const Upstream::HostDescriptionConstSharedPtr host) -> void {
         EXPECT_EQ(host_address_, host->address());
@@ -488,6 +994,7 @@ TEST_F(RouterTest, RetryRequestNotComplete) {
   router_.retry_state_->expectRetry();
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, RetryNoneHealthy) {
@@ -515,14 +1022,15 @@ TEST_F(RouterTest, RetryNoneHealthy) {
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   encoder1.stream_.resetStream(Http::StreamResetReason::LocalReset);
 
-  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _)).WillOnce(Return(nullptr));
+  EXPECT_CALL(cm_, httpConnPoolForCluster(_, _, _, _)).WillOnce(Return(nullptr));
   Http::TestHeaderMapImpl response_headers{
       {":status", "503"}, {"content-length", "19"}, {"content-type", "text/plain"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::NoHealthyUpstream));
+              setResponseFlag(RequestInfo::ResponseFlag::NoHealthyUpstream));
   router_.retry_state_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, RetryUpstreamReset) {
@@ -555,12 +1063,14 @@ TEST_F(RouterTest, RetryUpstreamReset) {
         return nullptr;
       }));
   router_.retry_state_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // Normal response.
   EXPECT_CALL(*router_.retry_state_, shouldRetry(_, _, _)).WillOnce(Return(RetryStatus::No));
   Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 }
 
 TEST_F(RouterTest, RetryUpstreamPerTryTimeout) {
@@ -585,6 +1095,7 @@ TEST_F(RouterTest, RetryUpstreamPerTryTimeout) {
   router_.retry_state_->expectRetry();
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(504));
   per_try_timeout_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // We expect this reset to kick off a new request.
   NiceMock<Http::MockStreamEncoder> encoder2;
@@ -603,6 +1114,7 @@ TEST_F(RouterTest, RetryUpstreamPerTryTimeout) {
   Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 }
 
 TEST_F(RouterTest, RetryUpstreamResetResponseStarted) {
@@ -629,6 +1141,35 @@ TEST_F(RouterTest, RetryUpstreamResetResponseStarted) {
   response_decoder->decodeHeaders(std::move(response_headers), false);
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  // For normal HTTP, once we have a 200 we consider this a success, even if a
+  // later reset occurs.
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
+}
+
+TEST_F(RouterTest, RetryUpstreamReset100ContinueResponseStarted) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"}, {"x-envoy-internal", "true"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // The 100-continue will result in resetting retry_state_, so when the stream
+  // is reset we won't even check shouldRetry().
+  EXPECT_CALL(*router_.retry_state_, shouldRetry(_, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encode100ContinueHeaders_(_));
+  Http::HeaderMapPtr continue_headers(new Http::TestHeaderMapImpl{{":status", "100"}});
+  response_decoder->decode100ContinueHeaders(std::move(continue_headers));
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
+  encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
 }
 
 TEST_F(RouterTest, RetryUpstream5xx) {
@@ -652,6 +1193,7 @@ TEST_F(RouterTest, RetryUpstream5xx) {
   Http::HeaderMapPtr response_headers1(new Http::TestHeaderMapImpl{{":status", "503"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // We expect the 5xx response to kick off a new request.
   EXPECT_CALL(encoder1.stream_, resetStream(_)).Times(0);
@@ -671,6 +1213,7 @@ TEST_F(RouterTest, RetryUpstream5xx) {
   Http::HeaderMapPtr response_headers2(new Http::TestHeaderMapImpl{{":status", "200"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
   response_decoder->decodeHeaders(std::move(response_headers2), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 }
 
 TEST_F(RouterTest, RetryTimeoutDuringRetryDelay) {
@@ -694,10 +1237,11 @@ TEST_F(RouterTest, RetryTimeoutDuringRetryDelay) {
   Http::HeaderMapPtr response_headers1(new Http::TestHeaderMapImpl{{":status", "503"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // Fire timeout.
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
 
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putResponseTime(_)).Times(0);
   Http::TestHeaderMapImpl response_headers{
@@ -705,6 +1249,7 @@ TEST_F(RouterTest, RetryTimeoutDuringRetryDelay) {
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   response_timeout_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, RetryTimeoutDuringRetryDelayWithUpstreamRequestNoHost) {
@@ -728,6 +1273,7 @@ TEST_F(RouterTest, RetryTimeoutDuringRetryDelayWithUpstreamRequestNoHost) {
   Http::HeaderMapPtr response_headers1(new Http::TestHeaderMapImpl{{":status", "503"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   Http::ConnectionPool::MockCancellable cancellable;
   EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
@@ -741,7 +1287,7 @@ TEST_F(RouterTest, RetryTimeoutDuringRetryDelayWithUpstreamRequestNoHost) {
   // Fire timeout.
   EXPECT_CALL(cancellable, cancel());
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRequestTimeout));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
 
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putResponseTime(_)).Times(0);
   Http::TestHeaderMapImpl response_headers{
@@ -749,6 +1295,54 @@ TEST_F(RouterTest, RetryTimeoutDuringRetryDelayWithUpstreamRequestNoHost) {
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
   EXPECT_CALL(callbacks_, encodeData(_, true));
   response_timeout_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+}
+
+// Retry timeout during a retry delay leading to no upstream host, as well as an alt response code.
+TEST_F(RouterTest, RetryTimeoutDuringRetryDelayWithUpstreamRequestNoHostAltResponseCode) {
+  NiceMock<Http::MockStreamEncoder> encoder1;
+  Http::StreamDecoder* response_decoder = nullptr;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        callbacks.onPoolReady(encoder1, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+  expectResponseTimerCreate();
+
+  Http::TestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"},
+                                  {"x-envoy-internal", "true"},
+                                  {"x-envoy-upstream-rq-timeout-alt-response", "204"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+
+  // 5xx response.
+  router_.retry_state_->expectRetry();
+  Http::HeaderMapPtr response_headers1(new Http::TestHeaderMapImpl{{":status", "503"}});
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
+  response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
+
+  Http::ConnectionPool::MockCancellable cancellable;
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder,
+                           Http::ConnectionPool::Callbacks&) -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        return &cancellable;
+      }));
+  router_.retry_state_->callback_();
+
+  // Fire timeout.
+  EXPECT_CALL(cancellable, cancel());
+  EXPECT_CALL(callbacks_.request_info_,
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRequestTimeout));
+
+  EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putResponseTime(_)).Times(0);
+  Http::TestHeaderMapImpl response_headers{{":status", "204"}};
+  EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), true));
+  response_timeout_->callback_();
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 }
 
 TEST_F(RouterTest, RetryUpstream5xxNotComplete) {
@@ -780,6 +1374,7 @@ TEST_F(RouterTest, RetryUpstream5xxNotComplete) {
   EXPECT_CALL(encoder1.stream_, resetStream(Http::StreamResetReason::LocalReset));
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   response_decoder->decodeHeaders(std::move(response_headers1), false);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // We expect the 5xx response to kick off a new request.
   NiceMock<Http::MockStreamEncoder> encoder2;
@@ -804,6 +1399,7 @@ TEST_F(RouterTest, RetryUpstream5xxNotComplete) {
   Http::HeaderMapPtr response_headers2(new Http::TestHeaderMapImpl{
       {":status", "200"}, {"x-envoy-immediate-health-check-fail", "true"}});
   response_decoder->decodeHeaders(std::move(response_headers2), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 
   EXPECT_EQ(1U,
             cm_.thread_local_cluster_.cluster_.info_->stats_store_.counter("retry.upstream_rq_503")
@@ -832,16 +1428,18 @@ TEST_F(RouterTest, RetryUpstreamGrpcCancelled) {
   expectResponseTimerCreate();
 
   Http::TestHeaderMapImpl headers{{"x-envoy-grpc-retry-on", "cancelled"},
-                                  {"x-envoy-internal", "true"}};
+                                  {"x-envoy-internal", "true"},
+                                  {"content-type", "application/grpc"}};
   HttpTestUtility::addDefaultHeaders(headers);
   router_.decodeHeaders(headers, true);
 
   // gRPC with status "cancelled" (1)
   router_.retry_state_->expectRetry();
   Http::HeaderMapPtr response_headers1(
-      new Http::TestHeaderMapImpl{{":status", "200"}, {":grpc-status", "1"}});
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"grpc-status", "1"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
   response_decoder->decodeHeaders(std::move(response_headers1), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 1));
 
   // We expect the grpc-status to result in a retried request.
   EXPECT_CALL(encoder1.stream_, resetStream(_)).Times(0);
@@ -857,9 +1455,11 @@ TEST_F(RouterTest, RetryUpstreamGrpcCancelled) {
 
   // Normal response.
   EXPECT_CALL(*router_.retry_state_, shouldRetry(_, _, _)).WillOnce(Return(RetryStatus::No));
-  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  Http::HeaderMapPtr response_headers(
+      new Http::TestHeaderMapImpl{{":status", "200"}, {"grpc-status", "0"}});
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(200));
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 }
 
 TEST_F(RouterTest, Shadow) {
@@ -901,6 +1501,7 @@ TEST_F(RouterTest, Shadow) {
 
   Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
 }
 
 TEST_F(RouterTest, AltStatName) {
@@ -932,6 +1533,7 @@ TEST_F(RouterTest, AltStatName) {
                                   {"x-envoy-upstream-canary", "true"},
                                   {"x-envoy-virtual-cluster", "hello"}});
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
 
   EXPECT_EQ(1U,
             stats_store_.counter("vhost.fake_vhost.vcluster.fake_virtual_cluster.upstream_rq_200")
@@ -951,15 +1553,68 @@ TEST_F(RouterTest, AltStatName) {
 }
 
 TEST_F(RouterTest, Redirect) {
-  MockRedirectEntry redirect;
-  EXPECT_CALL(redirect, newPath(_)).WillOnce(Return("hello"));
-  EXPECT_CALL(*callbacks_.route_, redirectEntry()).WillRepeatedly(Return(&redirect));
+  MockDirectResponseEntry direct_response;
+  EXPECT_CALL(direct_response, newPath(_)).WillOnce(Return("hello"));
+  EXPECT_CALL(direct_response, responseCode()).WillOnce(Return(Http::Code::MovedPermanently));
+  EXPECT_CALL(direct_response, responseBody()).WillOnce(ReturnRef(EMPTY_STRING));
+  EXPECT_CALL(direct_response, finalizeResponseHeaders(_, _));
+  EXPECT_CALL(*callbacks_.route_, directResponseEntry()).WillRepeatedly(Return(&direct_response));
 
   Http::TestHeaderMapImpl response_headers{{":status", "301"}, {"location", "hello"}};
   EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), true));
   Http::TestHeaderMapImpl headers;
   HttpTestUtility::addDefaultHeaders(headers);
   router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, RedirectFound) {
+  MockDirectResponseEntry direct_response;
+  EXPECT_CALL(direct_response, newPath(_)).WillOnce(Return("hello"));
+  EXPECT_CALL(direct_response, responseCode()).WillOnce(Return(Http::Code::Found));
+  EXPECT_CALL(direct_response, responseBody()).WillOnce(ReturnRef(EMPTY_STRING));
+  EXPECT_CALL(direct_response, finalizeResponseHeaders(_, _));
+  EXPECT_CALL(*callbacks_.route_, directResponseEntry()).WillRepeatedly(Return(&direct_response));
+
+  Http::TestHeaderMapImpl response_headers{{":status", "302"}, {"location", "hello"}};
+  EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), true));
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+}
+
+TEST_F(RouterTest, DirectResponse) {
+  NiceMock<MockDirectResponseEntry> direct_response;
+  EXPECT_CALL(direct_response, responseCode()).WillRepeatedly(Return(Http::Code::OK));
+  EXPECT_CALL(direct_response, responseBody()).WillRepeatedly(ReturnRef(EMPTY_STRING));
+  EXPECT_CALL(*callbacks_.route_, directResponseEntry()).WillRepeatedly(Return(&direct_response));
+
+  Http::TestHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), true));
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  EXPECT_EQ(1UL, config_.stats_.rq_direct_response_.value());
+}
+
+TEST_F(RouterTest, DirectResponseWithBody) {
+  NiceMock<MockDirectResponseEntry> direct_response;
+  EXPECT_CALL(direct_response, responseCode()).WillRepeatedly(Return(Http::Code::OK));
+  const std::string response_body("static response");
+  EXPECT_CALL(direct_response, responseBody()).WillRepeatedly(ReturnRef(response_body));
+  EXPECT_CALL(*callbacks_.route_, directResponseEntry()).WillRepeatedly(Return(&direct_response));
+
+  Http::TestHeaderMapImpl response_headers{
+      {":status", "200"}, {"content-length", "15"}, {"content-type", "text/plain"}};
+  EXPECT_CALL(callbacks_, encodeHeaders_(HeaderMapEqualRef(&response_headers), false));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_.decodeHeaders(headers, true);
+  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+  EXPECT_EQ(1UL, config_.stats_.rq_direct_response_.value());
 }
 
 TEST(RouterFilterUtilityTest, finalTimeout) {
@@ -1046,16 +1701,19 @@ TEST(RouterFilterUtilityTest, setUpstreamScheme) {
   {
     Upstream::MockClusterInfo cluster;
     Http::TestHeaderMapImpl headers;
-    EXPECT_CALL(cluster, sslContext()).WillOnce(Return(nullptr));
+    Network::MockTransportSocketFactory transport_socket_factory;
+    EXPECT_CALL(cluster, transportSocketFactory()).WillOnce(ReturnRef(transport_socket_factory));
+    EXPECT_CALL(transport_socket_factory, implementsSecureTransport()).WillOnce(Return(false));
     FilterUtility::setUpstreamScheme(headers, cluster);
     EXPECT_EQ("http", headers.get_(":scheme"));
   }
-
   {
     Upstream::MockClusterInfo cluster;
     Ssl::MockClientContext context;
     Http::TestHeaderMapImpl headers;
-    EXPECT_CALL(cluster, sslContext()).WillOnce(Return(&context));
+    Network::MockTransportSocketFactory transport_socket_factory;
+    EXPECT_CALL(cluster, transportSocketFactory()).WillOnce(ReturnRef(transport_socket_factory));
+    EXPECT_CALL(transport_socket_factory, implementsSecureTransport()).WillOnce(Return(true));
     FilterUtility::setUpstreamScheme(headers, cluster);
     EXPECT_EQ("https", headers.get_(":scheme"));
   }
@@ -1119,6 +1777,7 @@ TEST_F(RouterTest, CanaryStatusTrue) {
                                   {"x-envoy-virtual-cluster", "hello"}});
   ON_CALL(*cm_.conn_pool_.host_, canary()).WillByDefault(Return(true));
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
 
   EXPECT_EQ(1U,
             cm_.thread_local_cluster_.cluster_.info_->stats_store_.counter("canary.upstream_rq_200")
@@ -1150,6 +1809,7 @@ TEST_F(RouterTest, CanaryStatusFalse) {
                                   {"x-envoy-upstream-canary", "false"},
                                   {"x-envoy-virtual-cluster", "hello"}});
   response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
 
   EXPECT_EQ(0U,
             cm_.thread_local_cluster_.cluster_.info_->stats_store_.counter("canary.upstream_rq_200")
@@ -1318,7 +1978,7 @@ TEST_F(WatermarkTest, FilterWatermarks) {
                     .counter("upstream_flow_control_backed_up_total")
                     .value());
 
-  // Send one extra byte.  This should cause the buffer to go over the limit and pause downstream
+  // Send one extra byte. This should cause the buffer to go over the limit and pause downstream
   // data.
   Buffer::OwnedImpl last_byte("!");
   router_.decodeData(last_byte, true);
@@ -1326,7 +1986,7 @@ TEST_F(WatermarkTest, FilterWatermarks) {
                     .counter("upstream_flow_control_backed_up_total")
                     .value());
 
-  // Now set up the downstream connection.  The encoder will be given the buffered request body,
+  // Now set up the downstream connection. The encoder will be given the buffered request body,
   // The mock invocation below drains it, and the buffer will go under the watermark limit again.
   EXPECT_EQ(0U, cm_.thread_local_cluster_.cluster_.info_->stats_store_
                     .counter("upstream_flow_control_drained_total")
@@ -1357,7 +2017,7 @@ TEST_F(WatermarkTest, RetryRequestNotComplete) {
             return nullptr;
           }));
   EXPECT_CALL(callbacks_.request_info_,
-              setResponseFlag(Http::AccessLog::ResponseFlag::UpstreamRemoteReset));
+              setResponseFlag(RequestInfo::ResponseFlag::UpstreamRemoteReset));
   EXPECT_CALL(callbacks_.request_info_, onUpstreamHostSelected(_))
       .WillRepeatedly(Invoke([&](const Upstream::HostDescriptionConstSharedPtr host) -> void {
         EXPECT_EQ(host_address_, host->address());
@@ -1375,6 +2035,75 @@ TEST_F(WatermarkTest, RetryRequestNotComplete) {
   // This should not trigger a retry as the retry state has been deleted.
   EXPECT_CALL(cm_.conn_pool_.host_->outlier_detector_, putHttpResponseCode(503));
   encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+}
+
+class RouterTestChildSpan : public RouterTestBase {
+public:
+  RouterTestChildSpan() : RouterTestBase(true) {}
+};
+
+// Make sure child spans start/inject/finish with a normal flow.
+TEST_F(RouterTestChildSpan, BasicFlow) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  NiceMock<Http::MockStreamEncoder> encoder;
+  Http::StreamDecoder* response_decoder = nullptr;
+  Tracing::MockSpan* child_span{new Tracing::MockSpan()};
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        EXPECT_CALL(*child_span, injectContext(_));
+        callbacks.onPoolReady(encoder, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(callbacks_.active_span_, spawnChild_(_, "router fake_cluster egress", _))
+      .WillOnce(Return(child_span));
+  EXPECT_CALL(callbacks_, tracingConfig());
+  EXPECT_CALL(*child_span, setTag(Tracing::Tags::get().COMPONENT, Tracing::Tags::get().PROXY));
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  EXPECT_CALL(*child_span, finishSpan());
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
+// Make sure child spans start/inject/finish with a reset flow.
+TEST_F(RouterTestChildSpan, ResetFlow) {
+  EXPECT_CALL(callbacks_.route_->route_entry_, timeout())
+      .WillOnce(Return(std::chrono::milliseconds(0)));
+  EXPECT_CALL(callbacks_.dispatcher_, createTimer_(_)).Times(0);
+
+  NiceMock<Http::MockStreamEncoder> encoder;
+  Http::StreamDecoder* response_decoder = nullptr;
+  Tracing::MockSpan* child_span{new Tracing::MockSpan()};
+  EXPECT_CALL(cm_.conn_pool_, newStream(_, _))
+      .WillOnce(Invoke([&](Http::StreamDecoder& decoder, Http::ConnectionPool::Callbacks& callbacks)
+                           -> Http::ConnectionPool::Cancellable* {
+        response_decoder = &decoder;
+        EXPECT_CALL(*child_span, injectContext(_));
+        callbacks.onPoolReady(encoder, cm_.conn_pool_.host_);
+        return nullptr;
+      }));
+
+  Http::TestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_CALL(callbacks_.active_span_, spawnChild_(_, "router fake_cluster egress", _))
+      .WillOnce(Return(child_span));
+  EXPECT_CALL(callbacks_, tracingConfig());
+  EXPECT_CALL(*child_span, setTag(Tracing::Tags::get().COMPONENT, Tracing::Tags::get().PROXY));
+  router_.decodeHeaders(headers, true);
+
+  Http::HeaderMapPtr response_headers(new Http::TestHeaderMapImpl{{":status", "200"}});
+  response_decoder->decodeHeaders(std::move(response_headers), false);
+
+  EXPECT_CALL(*child_span, finishSpan());
+  encoder.stream_.resetStream(Http::StreamResetReason::RemoteReset);
 }
 
 } // namespace Router

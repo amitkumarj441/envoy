@@ -26,7 +26,7 @@ public:
     Stats::Scope& global_scope_;
     Stats::Scope& cluster_scope_;
     const std::string& prefix_;
-    const HeaderMap& response_headers_;
+    uint64_t response_status_code_;
     bool internal_request_;
     const std::string& request_vhost_name_;
     const std::string& request_vcluster_name_;
@@ -72,6 +72,8 @@ public:
   static bool is3xx(uint64_t code) { return code >= 300 && code < 400; }
   static bool is4xx(uint64_t code) { return code >= 400 && code < 500; }
   static bool is5xx(uint64_t code) { return code >= 500 && code < 600; }
+
+  static bool isGatewayError(uint64_t code) { return code >= 502 && code < 505; }
 
   static std::string groupStringForResponseCode(Code response_code);
 };

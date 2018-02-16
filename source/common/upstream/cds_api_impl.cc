@@ -2,15 +2,21 @@
 
 #include <string>
 
+#include "envoy/api/v2/cds.pb.validate.h"
+#include "envoy/api/v2/cluster/outlier_detection.pb.validate.h"
+
+#include "common/common/cleanup.h"
+#include "common/config/resources.h"
 #include "common/config/subscription_factory.h"
 #include "common/config/utility.h"
+#include "common/protobuf/utility.h"
 #include "common/upstream/cds_subscription.h"
 
 namespace Envoy {
 namespace Upstream {
 
-CdsApiPtr CdsApiImpl::create(const envoy::api::v2::ConfigSource& cds_config,
-                             const Optional<envoy::api::v2::ConfigSource>& eds_config,
+CdsApiPtr CdsApiImpl::create(const envoy::api::v2::core::ConfigSource& cds_config,
+                             const Optional<envoy::api::v2::core::ConfigSource>& eds_config,
                              ClusterManager& cm, Event::Dispatcher& dispatcher,
                              Runtime::RandomGenerator& random,
                              const LocalInfo::LocalInfo& local_info, Stats::Scope& scope) {
@@ -18,12 +24,14 @@ CdsApiPtr CdsApiImpl::create(const envoy::api::v2::ConfigSource& cds_config,
       new CdsApiImpl(cds_config, eds_config, cm, dispatcher, random, local_info, scope)};
 }
 
-CdsApiImpl::CdsApiImpl(const envoy::api::v2::ConfigSource& cds_config,
-                       const Optional<envoy::api::v2::ConfigSource>& eds_config, ClusterManager& cm,
-                       Event::Dispatcher& dispatcher, Runtime::RandomGenerator& random,
-                       const LocalInfo::LocalInfo& local_info, Stats::Scope& scope)
+CdsApiImpl::CdsApiImpl(const envoy::api::v2::core::ConfigSource& cds_config,
+                       const Optional<envoy::api::v2::core::ConfigSource>& eds_config,
+                       ClusterManager& cm, Event::Dispatcher& dispatcher,
+                       Runtime::RandomGenerator& random, const LocalInfo::LocalInfo& local_info,
+                       Stats::Scope& scope)
     : cm_(cm), scope_(scope.createScope("cluster_manager.cds.")) {
   Config::Utility::checkLocalInfo("cds", local_info);
+
   subscription_ =
       Config::SubscriptionFactory::subscriptionFromConfigSource<envoy::api::v2::Cluster>(
           cds_config, local_info.node(), dispatcher, cm, random, *scope_,
@@ -37,20 +45,25 @@ CdsApiImpl::CdsApiImpl(const envoy::api::v2::ConfigSource& cds_config,
 }
 
 void CdsApiImpl::onConfigUpdate(const ResourceVector& resources) {
+  cm_.adsMux().pause(Config::TypeUrl::get().ClusterLoadAssignment);
+  Cleanup eds_resume([this] { cm_.adsMux().resume(Config::TypeUrl::get().ClusterLoadAssignment); });
+  for (const auto& cluster : resources) {
+    MessageUtil::validate(cluster);
+  }
   // We need to keep track of which clusters we might need to remove.
   ClusterManager::ClusterInfoMap clusters_to_remove = cm_.clusters();
   for (auto& cluster : resources) {
     const std::string cluster_name = cluster.name();
     clusters_to_remove.erase(cluster_name);
     if (cm_.addOrUpdatePrimaryCluster(cluster)) {
-      ENVOY_LOG(info, "cds: add/update cluster '{}'", cluster_name);
+      ENVOY_LOG(debug, "cds: add/update cluster '{}'", cluster_name);
     }
   }
 
   for (auto cluster : clusters_to_remove) {
     const std::string cluster_name = cluster.first;
     if (cm_.removePrimaryCluster(cluster_name)) {
-      ENVOY_LOG(info, "cds: remove cluster '{}'", cluster_name);
+      ENVOY_LOG(debug, "cds: remove cluster '{}'", cluster_name);
     }
   }
 

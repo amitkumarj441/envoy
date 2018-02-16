@@ -5,6 +5,9 @@
 #include <string>
 #include <unordered_map>
 
+#include "envoy/api/v2/rds.pb.h"
+#include "envoy/api/v2/route/route.pb.h"
+#include "envoy/config/filter/network/http_connection_manager/v2/http_connection_manager.pb.h"
 #include "envoy/config/subscription.h"
 #include "envoy/http/codes.h"
 #include "envoy/init/init.h"
@@ -17,9 +20,6 @@
 
 #include "common/common/logger.h"
 #include "common/protobuf/utility.h"
-
-#include "api/filter/http_connection_manager.pb.h"
-#include "api/rds.pb.h"
 
 namespace Envoy {
 namespace Router {
@@ -34,9 +34,11 @@ public:
    *         configuration.
    */
   static RouteConfigProviderSharedPtr
-  create(const envoy::api::v2::filter::HttpConnectionManager& config, Runtime::Loader& runtime,
-         Upstream::ClusterManager& cm, Stats::Scope& scope, const std::string& stat_prefix,
-         Init::Manager& init_manager, RouteConfigProviderManager& route_config_provider_manager);
+  create(const envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager&
+             config,
+         Runtime::Loader& runtime, Upstream::ClusterManager& cm, Stats::Scope& scope,
+         const std::string& stat_prefix, Init::Manager& init_manager,
+         RouteConfigProviderManager& route_config_provider_manager);
 };
 
 /**
@@ -97,10 +99,10 @@ public:
 
   // Router::RdsRouteConfigProvider
   std::string configAsJson() const override {
-    return MessageUtil::getJsonStringFromMessage(route_config_proto_);
+    return MessageUtil::getJsonStringFromMessage(route_config_proto_, true);
   }
   const std::string& routeConfigName() const override { return route_config_name_; }
-  const std::string& clusterName() const override { return cluster_name_; }
+  const std::string& configSource() const override { return config_source_; }
   const std::string versionInfo() const override { return subscription_->versionInfo(); }
 
   // Config::SubscriptionCallbacks
@@ -114,13 +116,13 @@ private:
     ConfigConstSharedPtr config_;
   };
 
-  RdsRouteConfigProviderImpl(const envoy::api::v2::filter::Rds& rds,
-                             const std::string& manager_identifier, Runtime::Loader& runtime,
-                             Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher,
-                             Runtime::RandomGenerator& random,
-                             const LocalInfo::LocalInfo& local_info, Stats::Scope& scope,
-                             const std::string& stat_prefix, ThreadLocal::SlotAllocator& tls,
-                             RouteConfigProviderManagerImpl& route_config_provider_manager);
+  RdsRouteConfigProviderImpl(
+      const envoy::config::filter::network::http_connection_manager::v2::Rds& rds,
+      const std::string& manager_identifier, Runtime::Loader& runtime, Upstream::ClusterManager& cm,
+      Event::Dispatcher& dispatcher, Runtime::RandomGenerator& random,
+      const LocalInfo::LocalInfo& local_info, Stats::Scope& scope, const std::string& stat_prefix,
+      ThreadLocal::SlotAllocator& tls,
+      RouteConfigProviderManagerImpl& route_config_provider_manager);
 
   void registerInitTarget(Init::Manager& init_manager);
   void runInitializeCallbackIfAny();
@@ -129,7 +131,7 @@ private:
   Upstream::ClusterManager& cm_;
   std::unique_ptr<Envoy::Config::Subscription<envoy::api::v2::RouteConfiguration>> subscription_;
   ThreadLocal::SlotPtr tls_;
-  std::string cluster_name_;
+  std::string config_source_;
   const std::string route_config_name_;
   bool initialized_{};
   uint64_t last_config_hash_{};
@@ -155,29 +157,34 @@ public:
   // ServerRouteConfigProviderManager
   std::vector<RdsRouteConfigProviderSharedPtr> rdsRouteConfigProviders() override;
   // RouteConfigProviderManager
-  RouteConfigProviderSharedPtr getRouteConfigProvider(const envoy::api::v2::filter::Rds& rds,
-                                                      Upstream::ClusterManager& cm,
-                                                      Stats::Scope& scope,
-                                                      const std::string& stat_prefix,
-                                                      Init::Manager& init_manager) override;
+  RouteConfigProviderSharedPtr getRouteConfigProvider(
+      const envoy::config::filter::network::http_connection_manager::v2::Rds& rds,
+      Upstream::ClusterManager& cm, Stats::Scope& scope, const std::string& stat_prefix,
+      Init::Manager& init_manager) override;
 
 private:
-  /**
-   * Add the RdsRouteConfigProvider information to the buffer.
-   * @param provider supplies the Provider to extract information from.
-   * @param response supplies the buffer to fill with information.
-   */
-  void addRouteInfo(const RdsRouteConfigProvider& provider, Buffer::Instance& response);
-
   /**
    * The handler used in the Admin /routes endpoint. This handler is used to
    * populate the response Buffer::Instance with information about the currently
    * loaded dynamic HTTP Route Tables.
-   * @param url supplies the url sent to the Admin endpoint.
+   * @param path_and_query supplies the url path and query-params sent to the Admin endpoint.
+   * @param response_headers enables setting of http headers (eg content-type, cache-control) in
+   * the handler.
    * @param response supplies the buffer to fill with information.
    * @return Http::Code OK if the endpoint can parse and operate on the url, NotFound otherwise.
    */
-  Http::Code handlerRoutes(const std::string& url, Buffer::Instance& response);
+  Http::Code handlerRoutes(const std::string& path_and_query, Http::HeaderMap& response_headers,
+                           Buffer::Instance& response);
+
+  /**
+   * Helper function used by handlerRoutes. The function loops through the providers
+   * and adds them to the response.
+   * @param response supplies the buffer to fill with information.
+   * @param providers supplies the vector of providers to add to the response.
+   * @return Http::Code OK.
+   */
+  Http::Code handlerRoutesLoop(Buffer::Instance& response,
+                               const std::vector<RdsRouteConfigProviderSharedPtr> providers);
 
   std::unordered_map<std::string, std::weak_ptr<RdsRouteConfigProviderImpl>>
       route_config_providers_;

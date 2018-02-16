@@ -9,10 +9,9 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/common/assert.h"
+#include "common/common/fmt.h"
 #include "common/common/utility.h"
 #include "common/config/utility.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Stats {
@@ -33,43 +32,57 @@ Writer::~Writer() {
   }
 }
 
-void Writer::writeCounter(const std::string& name, uint64_t increment) {
-  std::string message(fmt::format("envoy.{}:{}|c", name, increment));
-  send(message);
-}
-
-void Writer::writeGauge(const std::string& name, uint64_t value) {
-  std::string message(fmt::format("envoy.{}:{}|g", name, value));
-  send(message);
-}
-
-void Writer::writeTimer(const std::string& name, const std::chrono::milliseconds& ms) {
-  std::string message(fmt::format("envoy.{}:{}|ms", name, ms.count()));
-  send(message);
-}
-
-void Writer::send(const std::string& message) {
+void Writer::write(const std::string& message) {
   ::send(fd_, message.c_str(), message.size(), MSG_DONTWAIT);
 }
 
 UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls,
-                             Network::Address::InstanceConstSharedPtr address)
-    : tls_(tls.allocateSlot()), server_address_(address) {
+                             Network::Address::InstanceConstSharedPtr address, const bool use_tag)
+    : tls_(tls.allocateSlot()), server_address_(std::move(address)), use_tag_(use_tag) {
   tls_->set([this](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
     return std::make_shared<Writer>(this->server_address_);
   });
 }
 
-void UdpStatsdSink::flushCounter(const std::string& name, uint64_t delta) {
-  tls_->getTyped<Writer>().writeCounter(name, delta);
+void UdpStatsdSink::flushCounter(const Counter& counter, uint64_t delta) {
+  const std::string message(
+      fmt::format("envoy.{}:{}|c{}", getName(counter), delta, buildTagStr(counter.tags())));
+  tls_->getTyped<Writer>().write(message);
 }
 
-void UdpStatsdSink::flushGauge(const std::string& name, uint64_t value) {
-  tls_->getTyped<Writer>().writeGauge(name, value);
+void UdpStatsdSink::flushGauge(const Gauge& gauge, uint64_t value) {
+  const std::string message(
+      fmt::format("envoy.{}:{}|g{}", getName(gauge), value, buildTagStr(gauge.tags())));
+  tls_->getTyped<Writer>().write(message);
 }
 
-void UdpStatsdSink::onTimespanComplete(const std::string& name, std::chrono::milliseconds ms) {
-  tls_->getTyped<Writer>().writeTimer(name, ms);
+void UdpStatsdSink::onHistogramComplete(const Histogram& histogram, uint64_t value) {
+  // For statsd histograms are all timers.
+  const std::string message(fmt::format("envoy.{}:{}|ms{}", getName(histogram),
+                                        std::chrono::milliseconds(value).count(),
+                                        buildTagStr(histogram.tags())));
+  tls_->getTyped<Writer>().write(message);
+}
+
+const std::string UdpStatsdSink::getName(const Metric& metric) {
+  if (use_tag_) {
+    return metric.tagExtractedName();
+  } else {
+    return metric.name();
+  }
+}
+
+const std::string UdpStatsdSink::buildTagStr(const std::vector<Tag>& tags) {
+  if (!use_tag_ || tags.empty()) {
+    return "";
+  }
+
+  std::vector<std::string> tag_strings;
+  tag_strings.reserve(tags.size());
+  for (const Tag& tag : tags) {
+    tag_strings.emplace_back(tag.name_ + ":" + tag.value_);
+  }
+  return "|#" + StringUtil::join(tag_strings, ",");
 }
 
 char TcpStatsdSink::STAT_PREFIX[] = "envoy.";
@@ -209,7 +222,7 @@ void TcpStatsdSink::TlsSink::write(Buffer::Instance& buffer) {
     connection_->connect();
   }
 
-  connection_->write(buffer);
+  connection_->write(buffer, false);
 }
 
 uint64_t TcpStatsdSink::TlsSink::usedBuffer() {

@@ -5,16 +5,9 @@
 namespace Envoy {
 namespace Event {
 
-Network::ClientConnectionPtr
-ValidationDispatcher::createClientConnection(Network::Address::InstanceConstSharedPtr,
-                                             Network::Address::InstanceConstSharedPtr) {
-  NOT_IMPLEMENTED;
-}
-
-Network::ClientConnectionPtr
-ValidationDispatcher::createSslClientConnection(Ssl::ClientContext&,
-                                                Network::Address::InstanceConstSharedPtr,
-                                                Network::Address::InstanceConstSharedPtr) {
+Network::ClientConnectionPtr ValidationDispatcher::createClientConnection(
+    Network::Address::InstanceConstSharedPtr, Network::Address::InstanceConstSharedPtr,
+    Network::TransportSocketPtr&&, const Network::ConnectionSocket::OptionsSharedPtr&) {
   NOT_IMPLEMENTED;
 }
 
@@ -23,18 +16,8 @@ Network::DnsResolverSharedPtr ValidationDispatcher::createDnsResolver(
   NOT_IMPLEMENTED;
 }
 
-Network::ListenerPtr ValidationDispatcher::createListener(Network::ConnectionHandler&,
-                                                          Network::ListenSocket&,
-                                                          Network::ListenerCallbacks&,
-                                                          Stats::Scope&,
-                                                          const Network::ListenerOptions&) {
-  NOT_IMPLEMENTED;
-}
-
-Network::ListenerPtr
-ValidationDispatcher::createSslListener(Network::ConnectionHandler&, Ssl::ServerContext&,
-                                        Network::ListenSocket&, Network::ListenerCallbacks&,
-                                        Stats::Scope&, const Network::ListenerOptions&) {
+Network::ListenerPtr ValidationDispatcher::createListener(Network::Socket&,
+                                                          Network::ListenerCallbacks&, bool, bool) {
   NOT_IMPLEMENTED;
 }
 

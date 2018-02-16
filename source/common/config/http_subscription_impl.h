@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/api/v2/core/base.pb.h"
 #include "envoy/config/subscription.h"
 
 #include "common/buffer/buffer_impl.h"
@@ -12,7 +13,6 @@
 #include "common/protobuf/protobuf.h"
 #include "common/protobuf/utility.h"
 
-#include "api/base.pb.h"
 #include "google/api/annotations.pb.h"
 
 namespace Envoy {
@@ -30,7 +30,7 @@ class HttpSubscriptionImpl : public Http::RestApiFetcher,
                              public Config::Subscription<ResourceType>,
                              Logger::Loggable<Logger::Id::config> {
 public:
-  HttpSubscriptionImpl(const envoy::api::v2::Node& node, Upstream::ClusterManager& cm,
+  HttpSubscriptionImpl(const envoy::api::v2::core::Node& node, Upstream::ClusterManager& cm,
                        const std::string& remote_cluster_name, Event::Dispatcher& dispatcher,
                        Runtime::RandomGenerator& random, std::chrono::milliseconds refresh_interval,
                        const Protobuf::MethodDescriptor& service_method, SubscriptionStats stats)
@@ -83,6 +83,7 @@ public:
     try {
       callbacks_->onConfigUpdate(typed_resources);
       request_.set_version_info(message.version_info());
+      stats_.version_.set(HashUtil::xxHash64(request_.version_info()));
       stats_.update_success_.inc();
     } catch (const EnvoyException& e) {
       ENVOY_LOG(warn, "REST config update rejected: {}", e.what());

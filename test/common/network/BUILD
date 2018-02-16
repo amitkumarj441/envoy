@@ -43,6 +43,7 @@ envoy_cc_test(
         "//source/common/network:utility_lib",
         "//source/common/stats:stats_lib",
         "//test/mocks/buffer:buffer_mocks",
+        "//test/mocks/event:event_mocks",
         "//test/mocks/network:network_mocks",
         "//test/mocks/server:server_mocks",
         "//test/mocks/stats:stats_mocks",
@@ -75,6 +76,7 @@ envoy_cc_test(
     srcs = ["filter_manager_impl_test.cc"],
     deps = [
         "//source/common/buffer:buffer_lib",
+        "//source/common/config:filter_json_lib",
         "//source/common/event:dispatcher_lib",
         "//source/common/filter:ratelimit_lib",
         "//source/common/filter:tcp_proxy_lib",
@@ -87,9 +89,22 @@ envoy_cc_test(
         "//test/mocks/network:network_mocks",
         "//test/mocks/ratelimit:ratelimit_mocks",
         "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/server:server_mocks",
         "//test/mocks/tracing:tracing_mocks",
         "//test/mocks/upstream:host_mocks",
         "//test/mocks/upstream:upstream_mocks",
+    ],
+)
+
+envoy_cc_test(
+    name = "lc_trie_test",
+    srcs = ["lc_trie_test.cc"],
+    deps = [
+        "//source/common/common:utility_lib",
+        "//source/common/network:address_lib",
+        "//source/common/network:cidr_range_lib",
+        "//source/common/network:lc_trie_lib",
+        "//test/test_common:utility_lib",
     ],
 )
 
@@ -127,14 +142,29 @@ envoy_cc_test(
         "//source/common/buffer:buffer_lib",
         "//source/common/event:dispatcher_includes",
         "//source/common/event:dispatcher_lib",
+        "//source/common/filter/listener:proxy_protocol_lib",
         "//source/common/network:listener_lib",
         "//source/common/network:utility_lib",
         "//source/common/stats:stats_lib",
+        "//source/server:connection_handler_lib",
         "//test/mocks/buffer:buffer_mocks",
         "//test/mocks/network:network_mocks",
         "//test/mocks/server:server_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:network_utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "resolver_test",
+    srcs = ["resolver_impl_test.cc"],
+    deps = [
+        "//source/common/network:address_lib",
+        "//source/common/network:resolver_lib",
+        "//source/common/protobuf",
+        "//test/mocks/network:network_mocks",
+        "//test/test_common:environment_lib",
+        "//test/test_common:registry_lib",
     ],
 )
 

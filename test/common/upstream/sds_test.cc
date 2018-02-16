@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "envoy/api/v2/core/base.pb.h"
+
 #include "common/config/utility.h"
 #include "common/filesystem/filesystem_impl.h"
 #include "common/http/message_impl.h"
@@ -20,7 +22,6 @@
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
 
-#include "api/base.pb.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -50,18 +51,24 @@ protected:
     )EOF";
 
     timer_ = new Event::MockTimer(&dispatcher_);
-    local_info_.zone_name_ = "us-east-1a";
-    envoy::api::v2::ConfigSource eds_config;
-    eds_config.mutable_api_config_source()->add_cluster_name("sds");
+    local_info_.node_.mutable_locality()->set_zone("us-east-1a");
+    envoy::api::v2::core::ConfigSource eds_config;
+    eds_config.mutable_api_config_source()->add_cluster_names("sds");
     eds_config.mutable_api_config_source()->mutable_refresh_delay()->set_seconds(1);
     sds_cluster_ = parseSdsClusterFromJson(raw_config, eds_config);
+    Upstream::ClusterManager::ClusterInfoMap cluster_map;
+    Upstream::MockCluster cluster;
+    cluster_map.emplace("sds", cluster);
+    EXPECT_CALL(cm_, clusters()).WillOnce(Return(cluster_map));
+    EXPECT_CALL(cluster, info()).Times(2);
+    EXPECT_CALL(*cluster.info_, addedViaApi());
     cluster_.reset(new EdsClusterImpl(sds_cluster_, runtime_, stats_, ssl_context_manager_,
                                       local_info_, cm_, dispatcher_, random_, false));
     EXPECT_EQ(Cluster::InitializePhase::Secondary, cluster_->initializePhase());
   }
 
   HostSharedPtr findHost(const std::string& address) {
-    for (HostSharedPtr host : cluster_->hosts()) {
+    for (HostSharedPtr host : cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()) {
       if (host->address()->ip()->addressAsString() == address) {
         return host;
       }
@@ -72,7 +79,7 @@ protected:
 
   uint64_t numHealthy() {
     uint64_t healthy = 0;
-    for (const HostSharedPtr& host : cluster_->hosts()) {
+    for (const HostSharedPtr& host : cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()) {
       if (host->healthy()) {
         healthy++;
       }
@@ -117,7 +124,7 @@ protected:
 
 TEST_F(SdsTest, Shutdown) {
   setupRequest();
-  cluster_->initialize();
+  cluster_->initialize([] {});
   EXPECT_CALL(request_, cancel());
   cluster_.reset();
 }
@@ -125,19 +132,16 @@ TEST_F(SdsTest, Shutdown) {
 TEST_F(SdsTest, PoolFailure) {
   setupPoolFailure();
   EXPECT_CALL(*timer_, enableTimer(_));
-  cluster_->initialize();
+  cluster_->initialize([] {});
 }
 
 TEST_F(SdsTest, NoHealthChecker) {
   InSequence s;
   setupRequest();
-  cluster_->initialize();
 
-  cluster_->addMemberUpdateCb(
-      [&](const std::vector<HostSharedPtr>&, const std::vector<HostSharedPtr>&) -> void {
-        membership_updated_.ready();
-      });
-  cluster_->setInitializedCb([&]() -> void { membership_updated_.ready(); });
+  cluster_->prioritySet().addMemberUpdateCb(
+      [&](uint32_t, const HostVector&, const HostVector&) -> void { membership_updated_.ready(); });
+  cluster_->initialize([&]() -> void { membership_updated_.ready(); });
 
   Http::MessagePtr message(new Http::ResponseMessageImpl(
       Http::HeaderMapPtr{new Http::TestHeaderMapImpl{{":status", "200"}}}));
@@ -148,20 +152,29 @@ TEST_F(SdsTest, NoHealthChecker) {
   EXPECT_CALL(*timer_, enableTimer(_));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_5f3725fa79001155", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
-  EXPECT_EQ(13UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(13UL, cluster_->info()->stats().membership_healthy_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(6860994315024339285U, cluster_->info()->stats().version_.value());
 
   // Hosts in SDS and static clusters should have empty hostname
-  EXPECT_EQ("", cluster_->hosts()[0]->hostname());
+  EXPECT_EQ("", cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->hostname());
 
   HostSharedPtr canary_host = findHost("10.0.16.43");
   EXPECT_TRUE(canary_host->canary());
-  EXPECT_EQ("us-east-1d", canary_host->zone());
+  EXPECT_EQ("us-east-1d", canary_host->locality().zone());
   EXPECT_EQ(40U, canary_host->weight());
   EXPECT_EQ(90UL, cluster_->info()->stats().max_host_weight_.value());
 
@@ -178,16 +191,25 @@ TEST_F(SdsTest, NoHealthChecker) {
   EXPECT_CALL(*timer_, enableTimer(_));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_2d1af371bb73a287", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
   EXPECT_EQ(canary_host, findHost("10.0.16.43"));
   EXPECT_TRUE(canary_host->canary());
-  EXPECT_EQ("us-east-1d", canary_host->zone());
+  EXPECT_EQ("us-east-1d", canary_host->locality().zone());
   EXPECT_EQ(50U, canary_host->weight());
   EXPECT_EQ(50UL, cluster_->info()->stats().max_host_weight_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(3250177750903005831U, cluster_->info()->stats().version_.value());
 
   // Now test the failure case, our cluster size should not change.
   setupRequest();
@@ -195,13 +217,21 @@ TEST_F(SdsTest, NoHealthChecker) {
 
   EXPECT_CALL(*timer_, enableTimer(_));
   callbacks_->onFailure(Http::AsyncClient::FailureReason::Reset);
-  EXPECT_EQ(13UL, cluster_->hosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
   EXPECT_EQ(50U, canary_host->weight());
   EXPECT_EQ(50UL, cluster_->info()->stats().max_host_weight_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
 
   // 503 response.
   setupRequest();
@@ -212,13 +242,22 @@ TEST_F(SdsTest, NoHealthChecker) {
       Http::HeaderMapPtr{new Http::TestHeaderMapImpl{{":status", "503"}}}));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_2d1af371bb73a287", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
   EXPECT_EQ(50U, canary_host->weight());
   EXPECT_EQ(50UL, cluster_->info()->stats().max_host_weight_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(3250177750903005831U, cluster_->info()->stats().version_.value());
 }
 
 TEST_F(SdsTest, HealthChecker) {
@@ -227,10 +266,9 @@ TEST_F(SdsTest, HealthChecker) {
   EXPECT_CALL(*health_checker, start());
   EXPECT_CALL(*health_checker, addHostCheckCompleteCb(_));
   cluster_->setHealthChecker(health_checker);
-  cluster_->setInitializedCb([&]() -> void { membership_updated_.ready(); });
 
   setupRequest();
-  cluster_->initialize();
+  cluster_->initialize([&]() -> void { membership_updated_.ready(); });
 
   // Load in all of the hosts the first time, this will setup first pass health checking. We expect
   // all the hosts to load in unhealthy.
@@ -243,40 +281,71 @@ TEST_F(SdsTest, HealthChecker) {
   EXPECT_CALL(*timer_, enableTimer(_));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_5f3725fa79001155", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
-  EXPECT_EQ(0UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(0UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(0UL, cluster_->info()->stats().membership_healthy_.value());
   EXPECT_EQ(0UL, numHealthy());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(3UL, cluster_->hostsPerZone().size());
-  EXPECT_EQ(0UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(0UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(0UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(3UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hostsPerLocality().get().size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(6860994315024339285U, cluster_->info()->stats().version_.value());
 
-  // Now run through and make all the hosts healthy except for the first one.
-  for (size_t i = 1; i < cluster_->hosts().size(); i++) {
-    cluster_->hosts()[i]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
-    health_checker->runCallbacks(cluster_->hosts()[i], true);
+  // Now run through and make all the hosts healthy except for the first one. Because we are
+  // blocking HC updates, they should all still be unhealthy.
+  for (size_t i = 1; i < cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size(); i++) {
+    cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[i]->healthFlagClear(
+        Host::HealthFlag::FAILED_ACTIVE_HC);
+    health_checker->runCallbacks(cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[i],
+                                 true);
   }
 
-  EXPECT_EQ(12UL, cluster_->healthyHosts().size());
-  EXPECT_EQ(12UL, cluster_->info()->stats().membership_healthy_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(0UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
+  EXPECT_EQ(0UL, cluster_->info()->stats().membership_healthy_.value());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      0UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
 
-  // Do the last one now which should fire the initialized event.
+  // Do the last one now which should fire the initialized event. It should also cause a healthy
+  // host recalculation and unblock health updates.
   EXPECT_CALL(membership_updated_, ready());
-  cluster_->hosts()[0]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
-  health_checker->runCallbacks(cluster_->hosts()[0], true);
+  cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->healthFlagClear(
+      Host::HealthFlag::FAILED_ACTIVE_HC);
+  health_checker->runCallbacks(cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0], true);
   EXPECT_EQ("hash_5f3725fa79001155", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(13UL, cluster_->info()->stats().membership_healthy_.value());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(6860994315024339285U, cluster_->info()->stats().version_.value());
 
   // Now we will remove some hosts, but since they are all healthy, they shouldn't actually be gone.
   setupRequest();
@@ -289,14 +358,23 @@ TEST_F(SdsTest, HealthChecker) {
       TestEnvironment::runfilesPath("test/common/upstream/test_data/sds_response_2.json"))));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_398882981ada7c10", cluster_->versionInfo());
-  EXPECT_EQ(14UL, cluster_->hosts().size());
-  EXPECT_EQ(13UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(14UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(13UL, cluster_->info()->stats().membership_healthy_.value());
   EXPECT_EQ(13UL, numHealthy());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(4145707046791707664U, cluster_->info()->stats().version_.value());
 
   // Now set one of the removed hosts to unhealthy, and return the same query again, this should
   // remove it.
@@ -310,14 +388,23 @@ TEST_F(SdsTest, HealthChecker) {
       TestEnvironment::runfilesPath("test/common/upstream/test_data/sds_response_2.json"))));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_398882981ada7c10", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
-  EXPECT_EQ(12UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(12UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(12UL, cluster_->info()->stats().membership_healthy_.value());
   EXPECT_EQ(12UL, numHealthy());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(4145707046791707664U, cluster_->info()->stats().version_.value());
 
   // Now add back one of the hosts that was previously missing but we still have and make sure
   // nothing changes.
@@ -330,19 +417,28 @@ TEST_F(SdsTest, HealthChecker) {
       TestEnvironment::runfilesPath("test/common/upstream/test_data/sds_response_3.json"))));
   callbacks_->onSuccess(std::move(message));
   EXPECT_EQ("hash_b9f8f43f828a3b25", cluster_->versionInfo());
-  EXPECT_EQ(13UL, cluster_->hosts().size());
-  EXPECT_EQ(12UL, cluster_->healthyHosts().size());
+  EXPECT_EQ(13UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(12UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ(12UL, cluster_->info()->stats().membership_healthy_.value());
   EXPECT_EQ(12UL, numHealthy());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone().size());
-  EXPECT_EQ(3UL, cluster_->healthyHostsPerZone()[0].size());
-  EXPECT_EQ(5UL, cluster_->healthyHostsPerZone()[1].size());
-  EXPECT_EQ(4UL, cluster_->healthyHostsPerZone()[2].size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get().size());
+  EXPECT_EQ(
+      3UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[0].size());
+  EXPECT_EQ(
+      5UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[1].size());
+  EXPECT_EQ(
+      4UL,
+      cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHostsPerLocality().get()[2].size());
+  EXPECT_EQ(13400729244851125029U, cluster_->info()->stats().version_.value());
 }
 
 TEST_F(SdsTest, Failure) {
   setupRequest();
-  cluster_->initialize();
+  cluster_->initialize([] {});
 
   std::string bad_response_json = R"EOF(
   {
@@ -363,7 +459,7 @@ TEST_F(SdsTest, Failure) {
 
 TEST_F(SdsTest, FailureArray) {
   setupRequest();
-  cluster_->initialize();
+  cluster_->initialize([] {});
 
   std::string bad_response_json = R"EOF(
   []

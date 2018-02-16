@@ -10,6 +10,8 @@
 
 #include "envoy/common/pure.h"
 
+#include "absl/numeric/int128.h"
+
 namespace Envoy {
 namespace Network {
 namespace Address {
@@ -35,9 +37,9 @@ public:
   virtual ~Ipv6() {}
 
   /**
-   * @return the 16-byte IPv6 address in network byte order.
+   * @return the absl::uint128 IPv6 address in network byte order.
    */
-  virtual std::array<uint8_t, 16> address() const PURE;
+  virtual absl::uint128 address() const PURE;
 };
 
 enum class IpVersion { v4, v6 };
@@ -101,7 +103,8 @@ public:
   bool operator!=(const Instance& rhs) const { return !operator==(rhs); }
 
   /**
-   * @return a human readable string for the address.
+   * @return a human readable string for the address that represents the
+   * physical/resolved address.
    *
    * This string will be in the following format:
    * For IPv4 addresses: "1.2.3.4:80"
@@ -109,6 +112,15 @@ public:
    * For pipe addresses: "/foo"
    */
   virtual const std::string& asString() const PURE;
+
+  /**
+   * @return a human readable string for the address that represents the
+   * logical/unresolved name.
+   *
+   * This string has a source-dependent format and should preserve the original
+   * name for Address::Instances resolved by a Network::Address::Resolver.
+   */
+  virtual const std::string& logicalName() const PURE;
 
   /**
    * Bind a socket to this address. The socket should have been created with a call to socket() on

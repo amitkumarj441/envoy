@@ -26,23 +26,30 @@ TEST_P(IntegrationTest, RouterNotFoundBodyBuffer) {
   testRouterNotFoundWithBody();
 }
 
+TEST_P(IntegrationTest, RouterClusterNotFound404) { testRouterClusterNotFound404(); }
+
+TEST_P(IntegrationTest, RouterClusterNotFound503) { testRouterClusterNotFound503(); }
+
 TEST_P(IntegrationTest, RouterRedirect) { testRouterRedirect(); }
+
+TEST_P(IntegrationTest, RouterDirectResponse) { testRouterDirectResponse(); }
+
+TEST_P(IntegrationTest, ComputedHealthCheck) { testComputedHealthCheck(); }
 
 TEST_P(IntegrationTest, DrainClose) { testDrainClose(); }
 
 TEST_P(IntegrationTest, ConnectionClose) {
   config_helper_.addFilter(ConfigHelper::DEFAULT_HEALTH_CHECK_FILTER);
-  executeActions({[&]() -> void { codec_client_ = makeHttpConnection(lookupPort("http")); },
-                  [&]() -> void {
-                    codec_client_->makeHeaderOnlyRequest(
-                        Http::TestHeaderMapImpl{{":method", "GET"},
-                                                {":path", "/healthcheck"},
-                                                {":authority", "host"},
-                                                {"connection", "close"}},
-                        *response_);
-                  },
-                  [&]() -> void { response_->waitForEndStream(); },
-                  [&]() -> void { codec_client_->waitForDisconnect(); }});
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  codec_client_->makeHeaderOnlyRequest(Http::TestHeaderMapImpl{{":method", "GET"},
+                                                               {":path", "/healthcheck"},
+                                                               {":authority", "host"},
+                                                               {"connection", "close"}},
+                                       *response_);
+  response_->waitForEndStream();
+  codec_client_->waitForDisconnect();
 
   EXPECT_TRUE(response_->complete());
   EXPECT_STREQ("200", response_->headers().Status()->value().c_str());
@@ -106,55 +113,55 @@ TEST_P(IntegrationTest, RouterUpstreamResponseBeforeRequestComplete) {
 
 TEST_P(IntegrationTest, Retry) { testRetry(); }
 
+TEST_P(IntegrationTest, EnvoyHandling100Continue) { testEnvoyHandling100Continue(); }
+
+TEST_P(IntegrationTest, EnvoyHandlingDuplicate100Continues) { testEnvoyHandling100Continue(true); }
+
+TEST_P(IntegrationTest, EnvoyProxyingEarly100Continue) { testEnvoyProxying100Continue(true); }
+
+TEST_P(IntegrationTest, EnvoyProxyingLate100Continue) { testEnvoyProxying100Continue(false); }
+
+TEST_P(IntegrationTest, EnvoyProxyingEarly100ContinueWithEncoderFilter) {
+  testEnvoyProxying100Continue(true, true);
+}
+
+TEST_P(IntegrationTest, EnvoyProxyingLate100ContinueWithEncoderFilter) {
+  testEnvoyProxying100Continue(false, true);
+}
+
 TEST_P(IntegrationTest, TwoRequests) { testTwoRequests(); }
 
 TEST_P(IntegrationTest, RetryHittingBufferLimit) { testRetryHittingBufferLimit(); }
 
 TEST_P(IntegrationTest, HittingDecoderFilterLimit) { testHittingDecoderFilterLimit(); }
 
-// Test hitting the bridge filter with too many response bytes to buffer.  Given
+// Test hitting the bridge filter with too many response bytes to buffer. Given
 // the headers are not proxied, the connection manager will send a 500.
 TEST_P(IntegrationTest, HittingEncoderFilterLimitBufferingHeaders) {
-  config_helper_.addFilter("{ name: envoy.grpc_http1_bridge, config: { deprecated_v1: true } }");
+  config_helper_.addFilter("{ name: envoy.grpc_http1_bridge, config: {} }");
   config_helper_.setBufferLimits(1024, 1024);
 
-  IntegrationCodecClientPtr codec_client;
-  FakeHttpConnectionPtr fake_upstream_connection;
-  IntegrationStreamDecoderPtr response(new IntegrationStreamDecoder(*dispatcher_));
-  FakeStreamPtr request;
-  executeActions({[&]() -> void { codec_client = makeHttpConnection(lookupPort("http")); },
-                  [&]() -> void {
-                    Http::StreamEncoder* request_encoder;
-                    request_encoder = &codec_client->startRequest(
-                        Http::TestHeaderMapImpl{{":method", "POST"},
-                                                {":path", "/test/long/url"},
-                                                {":scheme", "http"},
-                                                {":authority", "host"},
-                                                {"content-type", "application/grpc"},
-                                                {"x-envoy-retry-grpc-on", "cancelled"}},
-                        *response);
-                    codec_client->sendData(*request_encoder, 1024, true);
-                  },
-                  [&]() -> void {
-                    fake_upstream_connection =
-                        fake_upstreams_[0]->waitForHttpConnection(*dispatcher_);
-                  },
-                  [&]() -> void { request = fake_upstream_connection->waitForNewStream(); },
-                  [&]() -> void { request->waitForEndStream(*dispatcher_); },
-                  [&]() -> void {
-                    request->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
-                    // Make sure the headers are received before the body is sent.
-                    request->encodeData(1024 * 65, false);
-                  },
-                  [&]() -> void {
-                    response->waitForEndStream();
-                    EXPECT_TRUE(response->complete());
-                    EXPECT_STREQ("500", response->headers().Status()->value().c_str());
-                  },
-                  // Cleanup both downstream and upstream
-                  [&]() -> void { codec_client->close(); },
-                  [&]() -> void { fake_upstream_connection->close(); },
-                  [&]() -> void { fake_upstream_connection->waitForDisconnect(); }});
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  codec_client_->makeHeaderOnlyRequest(
+      Http::TestHeaderMapImpl{{":method", "POST"},
+                              {":path", "/test/long/url"},
+                              {":scheme", "http"},
+                              {":authority", "host"},
+                              {"content-type", "application/grpc"},
+                              {"x-envoy-retry-grpc-on", "cancelled"}},
+      *response_);
+  waitForNextUpstreamRequest();
+
+  // Send the overly large response. Because the grpc_http1_bridge filter buffers and buffer
+  // limits are sent, this will be translated into a 500 from Envoy.
+  upstream_request_->encodeHeaders(Http::TestHeaderMapImpl{{":status", "200"}}, false);
+  upstream_request_->encodeData(1024 * 65, false);
+
+  response_->waitForEndStream();
+  EXPECT_TRUE(response_->complete());
+  EXPECT_STREQ("500", response_->headers().Status()->value().c_str());
 }
 
 TEST_P(IntegrationTest, HittingEncoderFilterLimit) { testHittingEncoderFilterLimit(); }
@@ -191,7 +198,8 @@ TEST_P(IntegrationTest, OverlyLongHeaders) { testOverlyLongHeaders(); }
 
 TEST_P(IntegrationTest, UpstreamProtocolError) { testUpstreamProtocolError(); }
 
-void setRouteUsingWebsocket(envoy::api::v2::filter::HttpConnectionManager& hcm) {
+void setRouteUsingWebsocket(
+    envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager& hcm) {
   auto route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->add_routes();
   route->mutable_match()->set_prefix("/websocket/test");
   route->mutable_route()->set_prefix_rewrite("/websocket");
@@ -204,73 +212,138 @@ TEST_P(IntegrationTest, WebSocketConnectionDownstreamDisconnect) {
   config_helper_.setDefaultHostAndRoute("*", "/asd");
   // Enable websockets for the path /websocket/test
   config_helper_.addConfigModifier(&setRouteUsingWebsocket);
+  initialize();
 
   // WebSocket upgrade, send some data and disconnect downstream
   IntegrationTcpClientPtr tcp_client;
   FakeRawConnectionPtr fake_upstream_connection;
   const std::string upgrade_req_str = "GET /websocket/test HTTP/1.1\r\nHost: host\r\nConnection: "
-                                      "Upgrade\r\nUpgrade: websocket\r\n\r\n";
+                                      "keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
   const std::string upgrade_resp_str =
       "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-  executeActions({
-      [&]() -> void { tcp_client = makeTcpConnection(lookupPort("http")); },
-      // Send websocket upgrade request
-      // The request path gets rewritten from /websocket/test to /websocket.
-      // The size of headers received by the destination is 225 bytes.
-      [&]() -> void { tcp_client->write(upgrade_req_str); },
-      [&]() -> void { fake_upstream_connection = fake_upstreams_[0]->waitForRawConnection(); },
-      [&]() -> void { fake_upstream_connection->waitForData(225); },
-      // Accept websocket upgrade request
-      [&]() -> void { fake_upstream_connection->write(upgrade_resp_str); },
-      [&]() -> void { tcp_client->waitForData(upgrade_resp_str); },
-      // Standard TCP proxy semantics post upgrade
-      [&]() -> void { tcp_client->write("hello"); },
-      // datalen = 225 + strlen(hello)
-      [&]() -> void { fake_upstream_connection->waitForData(230); },
-      [&]() -> void { fake_upstream_connection->write("world"); },
-      [&]() -> void { tcp_client->waitForData(upgrade_resp_str + "world"); },
-      [&]() -> void { tcp_client->write("bye!"); },
-      // downstream disconnect
-      [&]() -> void { tcp_client->close(); },
-      // datalen = 225 + strlen(hello) + strlen(bye!)
-      [&]() -> void { fake_upstream_connection->waitForData(234); },
-      [&]() -> void { fake_upstream_connection->waitForDisconnect(); },
-  });
+
+  tcp_client = makeTcpConnection(lookupPort("http"));
+  // Send websocket upgrade request
+  // The request path gets rewritten from /websocket/test to /websocket.
+  // The size of headers received by the destination is 228 bytes.
+  tcp_client->write(upgrade_req_str);
+  fake_upstream_connection = fake_upstreams_[0]->waitForRawConnection();
+  const std::string data = fake_upstream_connection->waitForData(228);
+  // In HTTP1, the transfer-length is defined by use of the "chunked" transfer-coding, even if
+  // content-length header is present. No body websocket upgrade request send to upstream has
+  // content-length header and has no transfer-encoding header.
+  EXPECT_NE(data.find("content-length:"), std::string::npos);
+  EXPECT_EQ(data.find("transfer-encoding:"), std::string::npos);
+  // Accept websocket upgrade request
+  fake_upstream_connection->write(upgrade_resp_str);
+  tcp_client->waitForData(upgrade_resp_str);
+  // Standard TCP proxy semantics post upgrade
+  tcp_client->write("hello");
+  // datalen = 228 + strlen(hello)
+  fake_upstream_connection->waitForData(233);
+  fake_upstream_connection->write("world");
+  tcp_client->waitForData(upgrade_resp_str + "world");
+  tcp_client->write("bye!");
+  // downstream disconnect
+  tcp_client->close();
+  // datalen = 228 + strlen(hello) + strlen(bye!)
+  fake_upstream_connection->waitForData(237);
+  fake_upstream_connection->waitForDisconnect();
 }
 
 TEST_P(IntegrationTest, WebSocketConnectionUpstreamDisconnect) {
   config_helper_.setDefaultHostAndRoute("*", "/asd");
   config_helper_.addConfigModifier(&setRouteUsingWebsocket);
+  initialize();
 
   // WebSocket upgrade, send some data and disconnect upstream
   IntegrationTcpClientPtr tcp_client;
   FakeRawConnectionPtr fake_upstream_connection;
   const std::string upgrade_req_str = "GET /websocket/test HTTP/1.1\r\nHost: host\r\nConnection: "
-                                      "Upgrade\r\nUpgrade: websocket\r\n\r\n";
+                                      "keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
   const std::string upgrade_resp_str =
       "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-  executeActions(
-      {[&]() -> void { tcp_client = makeTcpConnection(lookupPort("http")); },
-       // Send websocket upgrade request
-       [&]() -> void { tcp_client->write(upgrade_req_str); },
-       [&]() -> void { fake_upstream_connection = fake_upstreams_[0]->waitForRawConnection(); },
-       // The request path gets rewritten from /websocket/test to /websocket.
-       // The size of headers received by the destination is 225 bytes.
-       [&]() -> void { fake_upstream_connection->waitForData(225); },
-       // Accept websocket upgrade request
-       [&]() -> void { fake_upstream_connection->write(upgrade_resp_str); },
-       [&]() -> void { tcp_client->waitForData(upgrade_resp_str); },
-       // Standard TCP proxy semantics post upgrade
-       [&]() -> void { tcp_client->write("hello"); },
-       // datalen = 225 + strlen(hello)
-       [&]() -> void { fake_upstream_connection->waitForData(230); },
-       [&]() -> void { fake_upstream_connection->write("world"); },
-       // upstream disconnect
-       [&]() -> void { fake_upstream_connection->close(); },
-       [&]() -> void { fake_upstream_connection->waitForDisconnect(); },
-       [&]() -> void { tcp_client->waitForDisconnect(); }});
+  tcp_client = makeTcpConnection(lookupPort("http"));
+  // Send websocket upgrade request
+  tcp_client->write(upgrade_req_str);
+  fake_upstream_connection = fake_upstreams_[0]->waitForRawConnection();
+  // The request path gets rewritten from /websocket/test to /websocket.
+  // The size of headers received by the destination is 228 bytes.
+  const std::string data = fake_upstream_connection->waitForData(228);
+  // In HTTP1, the transfer-length is defined by use of the "chunked" transfer-coding, even if
+  // content-length header is present. No body websocket upgrade request send to upstream has
+  // content-length header and has no transfer-encoding header.
+  EXPECT_NE(data.find("content-length:"), std::string::npos);
+  EXPECT_EQ(data.find("transfer-encoding:"), std::string::npos);
+  // Accept websocket upgrade request
+  fake_upstream_connection->write(upgrade_resp_str);
+  tcp_client->waitForData(upgrade_resp_str);
+  // Standard TCP proxy semantics post upgrade
+  tcp_client->write("hello");
+  // datalen = 228 + strlen(hello)
+  fake_upstream_connection->waitForData(233);
+  fake_upstream_connection->write("world");
+  // upstream disconnect
+  fake_upstream_connection->close();
+  fake_upstream_connection->waitForDisconnect();
+  tcp_client->waitForDisconnect();
 
   EXPECT_EQ(upgrade_resp_str + "world", tcp_client->data());
+}
+
+TEST_P(IntegrationTest, TestBind) {
+  std::string address_string;
+  if (GetParam() == Network::Address::IpVersion::v4) {
+    address_string = TestUtility::getIpv4Loopback();
+  } else {
+    address_string = "::1";
+  }
+  config_helper_.setSourceAddress(address_string);
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // Request 1.
+
+  codec_client_->makeRequestWithBody(Http::TestHeaderMapImpl{{":method", "GET"},
+                                                             {":path", "/test/long/url"},
+                                                             {":scheme", "http"},
+                                                             {":authority", "host"}},
+                                     1024, *response_);
+
+  fake_upstream_connection_ = fake_upstreams_[0]->waitForHttpConnection(*dispatcher_);
+  std::string address =
+      fake_upstream_connection_->connection().remoteAddress()->ip()->addressAsString();
+  EXPECT_EQ(address, address_string);
+  upstream_request_ = fake_upstream_connection_->waitForNewStream(*dispatcher_);
+  upstream_request_->waitForEndStream(*dispatcher_);
+  // Cleanup both downstream and upstream
+  codec_client_->close();
+  fake_upstream_connection_->close();
+  fake_upstream_connection_->waitForDisconnect();
+}
+
+TEST_P(IntegrationTest, TestFailedBind) {
+  config_helper_.setSourceAddress("8.8.8.8");
+
+  initialize();
+  // Envoy will create and close some number of connections when trying to bind.
+  // Make sure they don't cause assertion failures when we ignore them.
+  fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  // With no ability to successfully bind on an upstream connection Envoy should
+  // send a 500.
+  codec_client_->makeHeaderOnlyRequest(
+      Http::TestHeaderMapImpl{{":method", "GET"},
+                              {":path", "/test/long/url"},
+                              {":scheme", "http"},
+                              {":authority", "host"},
+                              {"x-forwarded-for", "10.0.0.1"},
+                              {"x-envoy-upstream-rq-timeout-ms", "1000"}},
+      *response_);
+  response_->waitForEndStream();
+  EXPECT_TRUE(response_->complete());
+  EXPECT_STREQ("503", response_->headers().Status()->value().c_str());
+  EXPECT_LT(0, test_server_->counter("cluster.cluster_0.bind_errors")->value());
 }
 
 } // namespace Envoy

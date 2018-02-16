@@ -1,4 +1,4 @@
-load("@protobuf_bzl//:protobuf.bzl", "cc_proto_library")
+load("@com_google_protobuf//:protobuf.bzl", "cc_proto_library")
 
 def envoy_package():
     native.package(default_visibility = ["//visibility:public"])
@@ -12,7 +12,7 @@ def envoy_copts(repository, test = False):
         "-Wnon-virtual-dtor",
         "-Woverloaded-virtual",
         "-Wold-style-cast",
-        "-std=c++0x",
+        "-std=c++14",
     ] + select({
         # Bazel adds an implicit -DNDEBUG for opt.
         repository + "//bazel:opt_build": [] if test else ["-ggdb3"],
@@ -28,7 +28,8 @@ def envoy_copts(repository, test = False):
         # TCLAP command line parser needs this to support int64_t/uint64_t
         "@bazel_tools//tools/osx:darwin": ["-DHAVE_LONG_LONG"],
         "//conditions:default": [],
-    }) + envoy_select_hot_restart(["-DENVOY_HOT_RESTART"], repository)
+    }) + envoy_select_hot_restart(["-DENVOY_HOT_RESTART"], repository) + \
+        envoy_select_google_grpc(["-DENVOY_GOOGLE_GRPC"], repository)
 
 # Compute the final linkopts based on various options.
 def envoy_linkopts():
@@ -38,10 +39,14 @@ def envoy_linkopts():
         # TODO(zuercher): build id could be supported via "-sectcreate __TEXT __build_id <file>"
         # The file could should contain the current git SHA (or enough placeholder data to allow
         # it to be rewritten by tools/git_sha_rewriter.py).
-        "@bazel_tools//tools/osx:darwin": [],
+        "@bazel_tools//tools/osx:darwin": [
+            # See note here: http://luajit.org/install.html
+            "-pagezero_size 10000", "-image_base 100000000",
+        ],
         "//conditions:default": [
             "-pthread",
             "-lrt",
+            "-ldl",
             # Force MD5 hash in build. This is part of the workaround for
             # https://github.com/bazelbuild/bazel/issues/2805. Bazel actually
             # does this by itself prior to
@@ -55,17 +60,22 @@ def envoy_linkopts():
             "-static-libstdc++",
             "-static-libgcc",
         ],
-    })
+    }) + envoy_select_force_libcpp(["--stdlib=libc++"],
+                                   ["-static-libstdc++", "-static-libgcc"]) \
+    + envoy_select_exported_symbols(["-Wl,-E"])
 
 # Compute the test linkopts based on various options.
 def envoy_test_linkopts():
     return select({
-        "@bazel_tools//tools/osx:darwin": [],
+        "@bazel_tools//tools/osx:darwin": [
+            # See note here: http://luajit.org/install.html
+            "-pagezero_size 10000", "-image_base 100000000",
+        ],
 
         # TODO(mattklein123): It's not great that we universally link against the following libs.
-        # In particular, -latomic is not needed on all platforms. Make this more granular.
-        "//conditions:default": ["-pthread", "-latomic"],
-    })
+        # In particular, -latomic and -lrt are not needed on all platforms. Make this more granular.
+        "//conditions:default": ["-pthread", "-lrt", "-ldl"],
+    }) + envoy_select_force_libcpp([], ["-latomic"])
 
 # References to Envoy external dependencies should be wrapped with this function.
 def envoy_external_dep_path(dep):
@@ -126,6 +136,8 @@ def envoy_cc_library(name,
         tags = tags,
         deps = deps + [envoy_external_dep_path(dep) for dep in external_deps] + [
             repository + "//include/envoy/common:base_includes",
+            repository + "//source/common/common:fmt_lib",
+            envoy_external_dep_path('abseil_strings'),
             envoy_external_dep_path('spdlog'),
             envoy_external_dep_path('fmtlib'),
         ],
@@ -157,19 +169,26 @@ def envoy_cc_binary(name,
                     data = [],
                     testonly = 0,
                     visibility = None,
+                    external_deps = [],
                     repository = "",
                     stamped = False,
-                    deps = []):
+                    deps = [],
+                    linkopts = []):
+
+    if not linkopts:
+        linkopts = envoy_linkopts()
+
     # Implicit .stamped targets to obtain builds with the (truncated) git SHA1.
     if stamped:
         _git_stamped_genrule(repository, name)
         _git_stamped_genrule(repository, name + ".stripped")
+    deps = deps + [envoy_external_dep_path(dep) for dep in external_deps]
     native.cc_binary(
         name = name,
         srcs = srcs,
         data = data,
         copts = envoy_copts(repository),
-        linkopts = envoy_linkopts(),
+        linkopts = linkopts,
         testonly = testonly,
         linkstatic = 1,
         visibility = visibility,
@@ -178,6 +197,36 @@ def envoy_cc_binary(name,
         # rewriting is robust.
         stamp = 1,
         deps = deps,
+    )
+
+# Envoy C++ fuzz test targes. These are not included in coverage runs.
+def envoy_cc_fuzz_test(name, corpus, deps = [], **kwargs):
+    test_lib_name = name + "_lib"
+    envoy_cc_test_library(
+        name = test_lib_name,
+        data = native.glob([corpus + "/**"]),
+        deps = deps + ["//test/fuzz:fuzz_runner_lib"],
+        **kwargs
+    )
+    native.cc_test(
+        name = name,
+        copts = envoy_copts("@envoy", test = True),
+        linkopts = envoy_test_linkopts(),
+        linkstatic = 1,
+        args = [PACKAGE_NAME + "/" + corpus],
+        deps = [
+            ":" + test_lib_name,
+            "//test/fuzz:main",
+        ],
+    )
+    native.cc_binary(
+        name = name + "_driverless",
+        copts = envoy_copts("@envoy", test = True),
+        linkopts = envoy_test_linkopts(),
+        linkstatic = 1,
+        testonly = 1,
+        deps = [":" + test_lib_name],
+        tags = ["manual"],
     )
 
 # Envoy C++ test targets should be specified with this function.
@@ -297,24 +346,29 @@ def _proto_header(proto_path):
 
 # Envoy proto targets should be specified with this function.
 def envoy_proto_library(name, srcs = [], deps = [], external_deps = []):
-    internal_name = name + "_internal"
+    # Ideally this would be native.{proto_library, cc_proto_library}.
+    # Unfortunately, this doesn't work with http_api_protos due to the PGV
+    # requirement to also use them in the non-native protobuf.bzl
+    # cc_proto_library; you end up with the same file built twice. So, also
+    # using protobuf.bzl cc_proto_library here.
+    cc_proto_deps = []
+
+    if "http_api_protos" in external_deps:
+        cc_proto_deps.append("@googleapis//:http_api_protos")
+
+    if "well_known_protos" in external_deps:
+        cc_proto_deps.append("@com_google_protobuf//:cc_wkt_protos")
+
     cc_proto_library(
-        name = internal_name,
-        srcs = srcs,
-        default_runtime = "//external:protobuf",
-        protoc = "//external:protoc",
-        deps = deps + [envoy_external_dep_path(dep) for dep in external_deps],
-        linkstatic = 1,
-    )
-    # We can't use include_prefix directly in cc_proto_library, since it
-    # confuses protoc. Instead, we create a shim cc_library that performs the
-    # remap of .pb.h location to Envoy canonical header paths.
-    native.cc_library(
         name = name,
-        hdrs = [_proto_header(s) for s in srcs if _proto_header(s)],
-        include_prefix = envoy_include_prefix(PACKAGE_NAME),
-        deps = [internal_name],
+        srcs = srcs,
+        default_runtime = "@com_google_protobuf//:protobuf",
+        protoc = "@com_google_protobuf//:protoc",
+        deps = deps + cc_proto_deps,
+        # Avoid generating .so, we don't need it, can interfere with builds
+        # such as OSS-Fuzz.
         linkstatic = 1,
+        visibility = ["//visibility:public"],
     )
 
 # Envoy proto descriptor targets should be specified with this function.
@@ -328,8 +382,8 @@ def envoy_proto_descriptor(name, out, srcs = [], external_deps = []):
         include_paths.append("external/googleapis")
 
     if "well_known_protos" in external_deps:
-        srcs.append("@protobuf_bzl//:well_known_protos")
-        include_paths.append("external/protobuf_bzl/src")
+        srcs.append("@com_google_protobuf//:well_known_protos")
+        include_paths.append("external/com_google_protobuf/src")
 
     options = ["--include_imports"]
     options.extend(["-I" + include_path for include_path in include_paths])
@@ -350,4 +404,25 @@ def envoy_select_hot_restart(xs, repository = ""):
         repository + "//bazel:disable_hot_restart": [],
         "@bazel_tools//tools/osx:darwin": [],
         "//conditions:default": xs,
+    })
+
+# Selects the given values if Google gRPC is enabled in the current build.
+def envoy_select_google_grpc(xs, repository = ""):
+    return select({
+        repository + "//bazel:disable_google_grpc": [],
+        "//conditions:default": xs,
+    })
+
+# Select the given values if exporting is enabled in the current build.
+def envoy_select_exported_symbols(xs):
+    return select({
+        "@envoy//bazel:enable_exported_symbols": xs,
+        "//conditions:default": [],
+    })
+
+def envoy_select_force_libcpp(if_libcpp, default = None):
+    return select({
+        "@envoy//bazel:force_libcpp": if_libcpp,
+        "@bazel_tools//tools/osx:darwin": [],
+        "//conditions:default": default or [],
     })

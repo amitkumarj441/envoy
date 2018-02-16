@@ -1,5 +1,7 @@
 #include <string>
 
+#include "envoy/config/filter/network/mongo_proxy/v2/mongo_proxy.pb.h"
+
 #include "server/config/network/mongo_proxy.h"
 
 #include "test/mocks/server/mocks.h"
@@ -27,6 +29,35 @@ TEST(MongoFilterConfigTest, CorrectConfigurationNoFaults) {
   NiceMock<MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
   NetworkFilterFactoryCb cb = factory.createFilterFactory(*json_config, context);
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addFilter(_));
+  cb(connection);
+}
+
+TEST(MongoFilterConfigTest, ValidProtoConfigurationNoFaults) {
+  envoy::config::filter::network::mongo_proxy::v2::MongoProxy config{};
+
+  config.set_access_log("path/to/access/log");
+  config.set_stat_prefix("my_stat_prefix");
+
+  NiceMock<MockFactoryContext> context;
+  MongoProxyFilterConfigFactory factory;
+  NetworkFilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addFilter(_));
+  cb(connection);
+}
+
+TEST(MongoFilterConfigTest, MongoFilterWithEmptyProto) {
+  NiceMock<MockFactoryContext> context;
+  MongoProxyFilterConfigFactory factory;
+  envoy::config::filter::network::mongo_proxy::v2::MongoProxy config =
+      *dynamic_cast<envoy::config::filter::network::mongo_proxy::v2::MongoProxy*>(
+          factory.createEmptyConfigProto().get());
+  config.set_access_log("path/to/access/log");
+  config.set_stat_prefix("my_stat_prefix");
+
+  NetworkFilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);
@@ -212,6 +243,20 @@ TEST(MongoFilterConfigTest, CorrectFaultConfiguration) {
   NiceMock<MockFactoryContext> context;
   MongoProxyFilterConfigFactory factory;
   NetworkFilterFactoryCb cb = factory.createFilterFactory(*json_config, context);
+  Network::MockConnection connection;
+  EXPECT_CALL(connection, addFilter(_));
+  cb(connection);
+}
+
+TEST(MongoFilterConfigTest, CorrectFaultConfigurationInProto) {
+  envoy::config::filter::network::mongo_proxy::v2::MongoProxy config{};
+  config.set_stat_prefix("my_stat_prefix");
+  config.mutable_delay()->set_percent(50);
+  config.mutable_delay()->mutable_fixed_delay()->set_seconds(500);
+
+  NiceMock<MockFactoryContext> context;
+  MongoProxyFilterConfigFactory factory;
+  NetworkFilterFactoryCb cb = factory.createFilterFactoryFromProto(config, context);
   Network::MockConnection connection;
   EXPECT_CALL(connection, addFilter(_));
   cb(connection);

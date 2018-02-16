@@ -2,15 +2,13 @@
 
 #include <dirent.h>
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <random>
 #include <string>
 #include <unordered_map>
 
+#include "envoy/api/os_sys_calls.h"
 #include "envoy/common/exception.h"
-#include "envoy/common/optional.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/thread_local/thread_local.h"
@@ -31,19 +29,10 @@ namespace Runtime {
 class RandomGeneratorImpl : public RandomGenerator {
 public:
   // Runtime::RandomGenerator
-  uint64_t random() override { return threadLocalGenerator()(); }
+  uint64_t random() override;
   std::string uuid() override;
 
   static const size_t UUID_LENGTH;
-
-private:
-  static std::ranlux48& threadLocalGenerator() {
-    std::chrono::nanoseconds now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::system_clock::now().time_since_epoch());
-    static thread_local std::ranlux48 generator(now.count() ^ Thread::Thread::currentThreadId());
-
-    return generator;
-  }
 };
 
 /**
@@ -73,7 +62,7 @@ class SnapshotImpl : public Snapshot,
                      Logger::Loggable<Logger::Id::runtime> {
 public:
   SnapshotImpl(const std::string& root_path, const std::string& override_path, RuntimeStats& stats,
-               RandomGenerator& generator);
+               RandomGenerator& generator, Api::OsSysCalls& os_sys_calls);
 
   // Runtime::Snapshot
   bool featureEnabled(const std::string& key, uint64_t default_value, uint64_t random_value,
@@ -101,6 +90,7 @@ public:
 
   const std::string& get(const std::string& key) const override;
   uint64_t getInteger(const std::string&, uint64_t default_value) const override;
+  const std::unordered_map<std::string, const Snapshot::Entry>& getAll() const override;
 
 private:
   struct Directory {
@@ -116,15 +106,11 @@ private:
     DIR* dir_;
   };
 
-  struct Entry {
-    std::string string_value_;
-    Optional<uint64_t> uint_value_;
-  };
-
   void walkDirectory(const std::string& path, const std::string& prefix);
 
-  std::unordered_map<std::string, Entry> values_;
+  std::unordered_map<std::string, const Entry> values_;
   RandomGenerator& generator_;
+  Api::OsSysCalls& os_sys_calls_;
 };
 
 /**
@@ -137,7 +123,8 @@ class LoaderImpl : public Loader {
 public:
   LoaderImpl(Event::Dispatcher& dispatcher, ThreadLocal::SlotAllocator& tls,
              const std::string& root_symlink_path, const std::string& subdir,
-             const std::string& override_dir, Stats::Store& store, RandomGenerator& generator);
+             const std::string& override_dir, Stats::Store& store, RandomGenerator& generator,
+             Api::OsSysCallsPtr os_sys_calls);
 
   // Runtime::Loader
   Snapshot& snapshot() override;
@@ -153,6 +140,7 @@ private:
   std::string override_path_;
   std::shared_ptr<SnapshotImpl> current_snapshot_;
   RuntimeStats stats_;
+  Api::OsSysCallsPtr os_sys_calls_;
 };
 
 /**
@@ -197,7 +185,12 @@ private:
       return default_value;
     }
 
+    const std::unordered_map<std::string, const Snapshot::Entry>& getAll() const override {
+      return values_;
+    }
+
     RandomGenerator& generator_;
+    std::unordered_map<std::string, const Snapshot::Entry> values_;
   };
 
   NullSnapshotImpl snapshot_;

@@ -7,42 +7,23 @@
 #include "common/common/assert.h"
 #include "common/upstream/load_balancer_impl.h"
 
+#include "absl/strings/string_view.h"
+
 namespace Envoy {
 namespace Upstream {
 
-RingHashLoadBalancer::RingHashLoadBalancer(HostSet& host_set, ClusterStats& stats,
-                                           Runtime::Loader& runtime,
-                                           Runtime::RandomGenerator& random)
-    : host_set_(host_set), stats_(stats), runtime_(runtime), random_(random) {
-  host_set_.addMemberUpdateCb([this](const std::vector<HostSharedPtr>&,
-                                     const std::vector<HostSharedPtr>&) -> void { refresh(); });
+RingHashLoadBalancer::RingHashLoadBalancer(
+    PrioritySet& priority_set, ClusterStats& stats, Runtime::Loader& runtime,
+    Runtime::RandomGenerator& random,
+    const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
+    const envoy::api::v2::Cluster::CommonLbConfig& common_config)
+    : ThreadAwareLoadBalancerBase(priority_set, stats, runtime, random, common_config),
+      config_(config) {}
 
-  refresh();
-}
-
-HostConstSharedPtr RingHashLoadBalancer::chooseHost(const LoadBalancerContext* context) {
-  if (LoadBalancerUtility::isGlobalPanic(host_set_, runtime_)) {
-    stats_.lb_healthy_panic_.inc();
-    return all_hosts_ring_.chooseHost(context, random_);
-  } else {
-    return healthy_hosts_ring_.chooseHost(context, random_);
-  }
-}
-
-HostConstSharedPtr RingHashLoadBalancer::Ring::chooseHost(const LoadBalancerContext* context,
-                                                          Runtime::RandomGenerator& random) {
+HostConstSharedPtr RingHashLoadBalancer::Ring::chooseHost(uint64_t h) const {
   if (ring_.empty()) {
     return nullptr;
   }
-
-  // If there is no hash in the context, just choose a random value (this effectively becomes
-  // the random LB but it won't crash if someone configures it this way).
-  // hashKey() may be computed on demand, so get it only once.
-  Optional<uint64_t> hash;
-  if (context) {
-    hash = context->hashKey();
-  }
-  const uint64_t h = hash.valid() ? hash.value() : random.random();
 
   // Ported from https://github.com/RJ/ketama/blob/master/libketama/ketama.c (ketama_get_server)
   // I've generally kept the variable names to make the code easier to compare.
@@ -76,10 +57,9 @@ HostConstSharedPtr RingHashLoadBalancer::Ring::chooseHost(const LoadBalancerCont
   }
 }
 
-void RingHashLoadBalancer::Ring::create(Runtime::Loader& runtime,
-                                        const std::vector<HostSharedPtr>& hosts) {
+RingHashLoadBalancer::Ring::Ring(const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
+                                 const HostVector& hosts) {
   ENVOY_LOG(trace, "ring hash: building ring");
-  ring_.clear();
   if (hosts.empty()) {
     return;
   }
@@ -92,7 +72,9 @@ void RingHashLoadBalancer::Ring::create(Runtime::Loader& runtime,
   //       standpoint and duplicates the regeneration computation. In the future we might want
   //       to generate the rings centrally and then just RCU them out to each thread. This is
   //       sufficient for getting started.
-  uint64_t min_ring_size = runtime.snapshot().getInteger("upstream.ring_hash.min_ring_size", 1024);
+  const uint64_t min_ring_size =
+      config.valid() ? PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.value(), minimum_ring_size, 1024)
+                     : 1024;
 
   uint64_t hashes_per_host = 1;
   if (hosts.size() < min_ring_size) {
@@ -102,15 +84,41 @@ void RingHashLoadBalancer::Ring::create(Runtime::Loader& runtime,
     }
   }
 
-  ENVOY_LOG(trace, "ring hash: min_ring_size={} hashes_per_host={}", min_ring_size,
-            hashes_per_host);
+  ENVOY_LOG(info, "ring hash: min_ring_size={} hashes_per_host={}", min_ring_size, hashes_per_host);
   ring_.reserve(hosts.size() * hashes_per_host);
+
+  const bool use_std_hash =
+      config.valid()
+          ? PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.value().deprecated_v1(), use_std_hash, true)
+          : true;
+
+  char hash_key_buffer[196];
   for (const auto& host : hosts) {
+    const std::string& address_string = host->address()->asString();
+    uint64_t offset_start = address_string.size();
+
+    // Currently, we support both IP and UDS addresses. The UDS max path length is ~108 on all Unix
+    // platforms that I know of. Given that, we can use a 196 char buffer which is plenty of room
+    // for UDS, '_', and up to 21 characters for the node ID. To be on the super safe side, there
+    // is a RELEASE_ASSERT here that checks this, in case someone in the future adds some type of
+    // new address that is larger, or runs on a platform where UDS is larger. I don't think it's
+    // worth the defensive coding to deal with the heap allocation case (e.g. via
+    // absl::InlinedVector) at the current time.
+    RELEASE_ASSERT(address_string.size() + 1 + StringUtil::MIN_ITOA_OUT_LEN <=
+                   sizeof(hash_key_buffer));
+    memcpy(hash_key_buffer, address_string.c_str(), offset_start);
+    hash_key_buffer[offset_start++] = '_';
     for (uint64_t i = 0; i < hashes_per_host; i++) {
-      std::string hash_key(host->address()->asString() + "_" + std::to_string(i));
-      // TODO(danielhochman): convert to HashUtil::xxHash64 when we have a migration strategy.
-      uint64_t hash = std::hash<std::string>()(hash_key);
-      ENVOY_LOG(trace, "ring hash: hash_key={} hash={}", hash_key, hash);
+      const uint64_t total_hash_key_len =
+          offset_start +
+          StringUtil::itoa(hash_key_buffer + offset_start, StringUtil::MIN_ITOA_OUT_LEN, i);
+      absl::string_view hash_key(hash_key_buffer, total_hash_key_len);
+
+      // Sadly std::hash provides no mechanism for hashing arbitrary bytes so we must copy here.
+      // xxHash is done wihout copies.
+      const uint64_t hash = use_std_hash ? std::hash<std::string>()(std::string(hash_key))
+                                         : HashUtil::xxHash64(hash_key);
+      ENVOY_LOG(trace, "ring hash: hash_key={} hash={}", hash_key.data(), hash);
       ring_.push_back({hash, host});
     }
   }
@@ -123,11 +131,6 @@ void RingHashLoadBalancer::Ring::create(Runtime::Loader& runtime,
     ENVOY_LOG(trace, "ring hash: host={} hash={}", entry.host_->address()->asString(), entry.hash_);
   }
 #endif
-}
-
-void RingHashLoadBalancer::refresh() {
-  all_hosts_ring_.create(runtime_, host_set_.hosts());
-  healthy_hosts_ring_.create(runtime_, host_set_.healthyHosts());
 }
 
 } // namespace Upstream

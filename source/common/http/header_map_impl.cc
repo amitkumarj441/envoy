@@ -6,8 +6,8 @@
 
 #include "common/common/assert.h"
 #include "common/common/empty_string.h"
-#include "common/common/singleton.h"
 #include "common/common/utility.h"
+#include "common/singleton/const_singleton.h"
 
 namespace Envoy {
 namespace Http {
@@ -86,7 +86,10 @@ void HeaderString::append(const char* data, uint32_t size) {
   case Type::Dynamic: {
     // We can get here either because we didn't fit in inline or we are already dynamic.
     if (type_ == Type::Inline) {
-      uint32_t new_capacity = (string_length_ + size) * 2;
+      const uint64_t new_capacity = (static_cast<uint64_t>(string_length_) + size) * 2;
+      // If the resizing will cause buffer overflow due to hitting uint32_t::max, an OOM is likely
+      // imminent. Fast-fail rather than allow a buffer overflow attack (issue #1421)
+      RELEASE_ASSERT(new_capacity <= std::numeric_limits<uint32_t>::max());
       buffer_.dynamic_ = static_cast<char*>(malloc(new_capacity));
       memcpy(buffer_.dynamic_, inline_buffer_, string_length_);
       dynamic_capacity_ = new_capacity;
@@ -256,7 +259,7 @@ HeaderMapImpl::HeaderMapImpl() { memset(&inline_headers_, 0, sizeof(inline_heade
 
 HeaderMapImpl::HeaderMapImpl(const HeaderMap& rhs) : HeaderMapImpl() {
   rhs.iterate(
-      [](const HeaderEntry& header, void* context) -> void {
+      [](const HeaderEntry& header, void* context) -> HeaderMap::Iterate {
         // TODO(mattklein123) PERF: Avoid copying here is not necessary.
         HeaderString key_string;
         key_string.setCopy(header.key().c_str(), header.key().size());
@@ -265,6 +268,7 @@ HeaderMapImpl::HeaderMapImpl(const HeaderMap& rhs) : HeaderMapImpl() {
 
         static_cast<HeaderMapImpl*>(context)->addViaMove(std::move(key_string),
                                                          std::move(value_string));
+        return HeaderMap::Iterate::Continue;
       },
       this);
 }
@@ -359,6 +363,22 @@ void HeaderMapImpl::addCopy(const LowerCaseString& key, const std::string& value
   ASSERT(new_value.empty());
 }
 
+void HeaderMapImpl::setReference(const LowerCaseString& key, const std::string& value) {
+  HeaderString ref_key(key);
+  HeaderString ref_value(value);
+  remove(key);
+  insertByKey(std::move(ref_key), std::move(ref_value));
+}
+
+void HeaderMapImpl::setReferenceKey(const LowerCaseString& key, const std::string& value) {
+  HeaderString ref_key(key);
+  HeaderString new_value;
+  new_value.setCopy(value.c_str(), value.size());
+  remove(key);
+  insertByKey(std::move(ref_key), std::move(new_value));
+  ASSERT(new_value.empty());
+}
+
 uint64_t HeaderMapImpl::byteSize() const {
   uint64_t byte_size = 0;
   for (const HeaderEntryImpl& header : headers_) {
@@ -379,9 +399,52 @@ const HeaderEntry* HeaderMapImpl::get(const LowerCaseString& key) const {
   return nullptr;
 }
 
+HeaderEntry* HeaderMapImpl::get(const LowerCaseString& key) {
+  for (HeaderEntryImpl& header : headers_) {
+    if (header.key() == key.get().c_str()) {
+      return &header;
+    }
+  }
+
+  return nullptr;
+}
+
 void HeaderMapImpl::iterate(ConstIterateCb cb, void* context) const {
   for (const HeaderEntryImpl& header : headers_) {
-    cb(header, context);
+    if (cb(header, context) == HeaderMap::Iterate::Break) {
+      break;
+    }
+  }
+}
+
+void HeaderMapImpl::iterateReverse(ConstIterateCb cb, void* context) const {
+  for (auto it = headers_.rbegin(); it != headers_.rend(); it++) {
+    if (cb(*it, context) == HeaderMap::Iterate::Break) {
+      break;
+    }
+  }
+}
+
+HeaderMap::Lookup HeaderMapImpl::lookup(const LowerCaseString& key,
+                                        const HeaderEntry** entry) const {
+  StaticLookupEntry::EntryCb cb = ConstSingleton<StaticLookupTable>::get().find(key.get().c_str());
+  if (cb) {
+    // The accessor callbacks for predefined inline headers take a HeaderMapImpl& as an argument;
+    // even though we don't make any modifications, we need to cast_cast in order to use the
+    // accessor.
+    //
+    // Making this work without const_cast would require managing an additional const accessor
+    // callback for each predefined inline header and add to the complexity of the code.
+    StaticLookupResponse ref_lookup_response = cb(const_cast<HeaderMapImpl&>(*this));
+    *entry = *ref_lookup_response.entry_;
+    if (*entry) {
+      return Lookup::Found;
+    } else {
+      return Lookup::NotFound;
+    }
+  } else {
+    *entry = nullptr;
+    return Lookup::NotSupported;
   }
 }
 

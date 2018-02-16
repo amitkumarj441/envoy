@@ -24,7 +24,7 @@ public:
   GrpcHttp1BridgeFilterTest() : filter_(cm_) {
     filter_.setDecoderFilterCallbacks(decoder_callbacks_);
     filter_.setEncoderFilterCallbacks(encoder_callbacks_);
-    ON_CALL(decoder_callbacks_.request_info_, protocol()).WillByDefault(ReturnPointee(&protocol_));
+    ON_CALL(decoder_callbacks_.request_info_, protocol()).WillByDefault(ReturnRef(protocol_));
   }
 
   ~GrpcHttp1BridgeFilterTest() { filter_.onDestroy(); }
@@ -33,7 +33,7 @@ public:
   Http1BridgeFilter filter_;
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
   NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks_;
-  Http::Protocol protocol_{Http::Protocol::Http11};
+  Optional<Http::Protocol> protocol_{Http::Protocol::Http11};
 };
 
 TEST_F(GrpcHttp1BridgeFilterTest, NoRoute) {
@@ -67,6 +67,10 @@ TEST_F(GrpcHttp1BridgeFilterTest, StatsHttp2HeaderOnlyResponse) {
                                           {":path", "/lyft.users.BadCompanions/GetBadCompanions"}};
 
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, true));
+
+  Http::TestHeaderMapImpl continue_headers{{":status", "100"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue,
+            filter_.encode100ContinueHeaders(continue_headers));
 
   Http::TestHeaderMapImpl response_headers{{":status", "200"}, {"grpc-status", "1"}};
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.encodeHeaders(response_headers, true));

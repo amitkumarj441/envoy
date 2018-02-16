@@ -8,28 +8,25 @@
 
 #include "common/common/assert.h"
 #include "common/common/enum_to_int.h"
+#include "common/common/fmt.h"
 #include "common/http/headers.h"
 #include "common/http/message_impl.h"
 #include "common/http/utility.h"
-#include "common/json/config_schemas.h"
 #include "common/network/utility.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Filter {
 namespace Auth {
 namespace ClientSsl {
 
-Config::Config(const Json::Object& config, ThreadLocal::SlotAllocator& tls,
-               Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher, Stats::Scope& scope,
-               Runtime::RandomGenerator& random)
-    : RestApiFetcher(cm, config.getString("auth_api_cluster"), dispatcher, random,
-                     std::chrono::milliseconds(config.getInteger("refresh_delay_ms", 60000))),
-      tls_(tls.allocateSlot()), ip_white_list_(config, "ip_white_list"),
-      stats_(generateStats(scope, config.getString("stat_prefix"))) {
-
-  config.validateSchema(Json::Schema::CLIENT_SSL_NETWORK_FILTER_SCHEMA);
+Config::Config(const envoy::config::filter::network::client_ssl_auth::v2::ClientSSLAuth& config,
+               ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cm,
+               Event::Dispatcher& dispatcher, Stats::Scope& scope, Runtime::RandomGenerator& random)
+    : RestApiFetcher(
+          cm, config.auth_api_cluster(), dispatcher, random,
+          std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(config, refresh_delay, 60000))),
+      tls_(tls.allocateSlot()), ip_white_list_(config.ip_white_list()),
+      stats_(generateStats(scope, config.stat_prefix())) {
 
   if (!cm.get(remote_cluster_name_)) {
     throw EnvoyException(
@@ -41,9 +38,11 @@ Config::Config(const Json::Object& config, ThreadLocal::SlotAllocator& tls,
       [empty](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr { return empty; });
 }
 
-ConfigSharedPtr Config::create(const Json::Object& config, ThreadLocal::SlotAllocator& tls,
-                               Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher,
-                               Stats::Scope& scope, Runtime::RandomGenerator& random) {
+ConfigSharedPtr
+Config::create(const envoy::config::filter::network::client_ssl_auth::v2::ClientSSLAuth& config,
+               ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cm,
+               Event::Dispatcher& dispatcher, Stats::Scope& scope,
+               Runtime::RandomGenerator& random) {
   ConfigSharedPtr new_config(new Config(config, tls, cm, dispatcher, scope, random));
   new_config->initialize();
   return new_config;
@@ -82,7 +81,7 @@ void Config::createRequest(Http::Message& request) {
   request.headers().insertPath().value(Path);
 }
 
-Network::FilterStatus Instance::onData(Buffer::Instance&) {
+Network::FilterStatus Instance::onData(Buffer::Instance&, bool) {
   return Network::FilterStatus::Continue;
 }
 
@@ -104,7 +103,7 @@ void Instance::onEvent(Network::ConnectionEvent event) {
   }
 
   ASSERT(read_callbacks_->connection().ssl());
-  if (config_->ipWhiteList().contains(read_callbacks_->connection().remoteAddress())) {
+  if (config_->ipWhiteList().contains(*read_callbacks_->connection().remoteAddress())) {
     config_->stats().auth_ip_white_list_.inc();
     read_callbacks_->continueReading();
     return;

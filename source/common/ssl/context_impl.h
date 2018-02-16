@@ -22,10 +22,12 @@ namespace Envoy {
 namespace Ssl {
 
 // clang-format off
-#define ALL_SSL_STATS(COUNTER, GAUGE, TIMER)                                                       \
+#define ALL_SSL_STATS(COUNTER, GAUGE, HISTOGRAM)                                                   \
   COUNTER(connection_error)                                                                        \
   COUNTER(handshake)                                                                               \
+  COUNTER(session_reused)                                                                          \
   COUNTER(no_certificate)                                                                          \
+  COUNTER(fail_no_sni_match)                                                                       \
   COUNTER(fail_verify_no_cert)                                                                     \
   COUNTER(fail_verify_error)                                                                       \
   COUNTER(fail_verify_san)                                                                         \
@@ -36,13 +38,11 @@ namespace Ssl {
  * Wrapper struct for SSL stats. @see stats_macros.h
  */
 struct SslStats {
-  ALL_SSL_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_TIMER_STRUCT)
+  ALL_SSL_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 };
 
 class ContextImpl : public virtual Context {
 public:
-  ~ContextImpl() { parent_.releaseContext(this); }
-
   virtual bssl::UniquePtr<SSL> newSsl() const;
 
   /**
@@ -71,18 +71,18 @@ public:
   SslStats& stats() { return stats_; }
 
   // Ssl::Context
-  size_t daysUntilFirstCertExpires() override;
-  std::string getCaCertInformation() override;
-  std::string getCertChainInformation() override;
+  size_t daysUntilFirstCertExpires() const override;
+  std::string getCaCertInformation() const override;
+  std::string getCertChainInformation() const override;
 
 protected:
-  ContextImpl(ContextManagerImpl& parent, Stats::Scope& scope, ContextConfig& config);
+  ContextImpl(ContextManagerImpl& parent, Stats::Scope& scope, const ContextConfig& config);
 
   /**
-   * Specifies the context for which the session can be reused.  Any data is acceptable here.
-   * @see SSL_CTX_set_session_id_ctx
+   * The global SSL-library index used for storing a pointer to the context
+   * in the SSL instance, for retrieval in callbacks.
    */
-  static const unsigned char SERVER_SESSION_ID_CONTEXT;
+  static int sslContextIndex();
 
   static int verifyCallback(X509_STORE_CTX* store_ctx, void* arg);
   int verifyCertificate(X509* cert);
@@ -101,11 +101,10 @@ protected:
 
   std::vector<uint8_t> parseAlpnProtocols(const std::string& alpn_protocols);
   static SslStats generateStats(Stats::Scope& scope);
-  int32_t getDaysUntilExpiration(const X509* cert);
-  bssl::UniquePtr<X509> loadCert(const std::string& cert_file);
-  static std::string getSerialNumber(X509* cert);
-  std::string getCaFileName() { return ca_file_path_; };
-  std::string getCertChainFileName() { return cert_chain_file_path_; };
+  int32_t getDaysUntilExpiration(const X509* cert) const;
+  static std::string getSerialNumber(const X509* cert);
+  std::string getCaFileName() const { return ca_file_path_; };
+  std::string getCertChainFileName() const { return cert_chain_file_path_; };
 
   ContextManagerImpl& parent_;
   bssl::UniquePtr<SSL_CTX> ctx_;
@@ -118,11 +117,16 @@ protected:
   bssl::UniquePtr<X509> cert_chain_;
   std::string ca_file_path_;
   std::string cert_chain_file_path_;
+  const uint16_t min_protocol_version_;
+  const uint16_t max_protocol_version_;
+  const std::string ecdh_curves_;
 };
 
 class ClientContextImpl : public ContextImpl, public ClientContext {
 public:
-  ClientContextImpl(ContextManagerImpl& parent, Stats::Scope& scope, ClientContextConfig& config);
+  ClientContextImpl(ContextManagerImpl& parent, Stats::Scope& scope,
+                    const ClientContextConfig& config);
+  ~ClientContextImpl() { parent_.releaseClientContext(this); }
 
   bssl::UniquePtr<SSL> newSsl() const override;
 
@@ -132,16 +136,28 @@ private:
 
 class ServerContextImpl : public ContextImpl, public ServerContext {
 public:
-  ServerContextImpl(ContextManagerImpl& parent, Stats::Scope& scope, ServerContextConfig& config,
+  ServerContextImpl(ContextManagerImpl& parent, const std::string& listener_name,
+                    const std::vector<std::string>& server_names, Stats::Scope& scope,
+                    const ServerContextConfig& config, bool skip_context_update,
                     Runtime::Loader& runtime);
+  ~ServerContextImpl() { parent_.releaseServerContext(this, listener_name_, server_names_); }
 
 private:
+  ssl_select_cert_result_t processClientHello(const SSL_CLIENT_HELLO* client_hello);
+  void updateConnectionContext(SSL* ssl);
+
   int alpnSelectCallback(const unsigned char** out, unsigned char* outlen, const unsigned char* in,
                          unsigned int inlen);
+  int sessionTicketProcess(SSL* ssl, uint8_t* key_name, uint8_t* iv, EVP_CIPHER_CTX* ctx,
+                           HMAC_CTX* hmac_ctx, int encrypt);
 
+  const std::string listener_name_;
+  const std::vector<std::string> server_names_;
+  const bool skip_context_update_;
   Runtime::Loader& runtime_;
   std::vector<uint8_t> parsed_alt_alpn_protocols_;
+  const std::vector<ServerContextConfig::SessionTicketKey> session_ticket_keys_;
 };
 
-} // Ssl
-} // Envoy
+} // namespace Ssl
+} // namespace Envoy

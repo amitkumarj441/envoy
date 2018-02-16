@@ -319,7 +319,7 @@ TEST(JsonLoaderTest, NestedSchema) {
   )EOF";
 
   std::string json_string = R"EOF(
-  { 
+  {
     "bar": "baz",
     "foo": {
       "value1": "should have been a number",
@@ -443,6 +443,22 @@ TEST(JsonLoaderTest, YamlObject) {
     const Json::ObjectSharedPtr json = Json::Factory::loadFromYamlString("Null");
     EXPECT_TRUE(json->isNull());
   }
+}
+
+TEST(JsonLoaderTest, BadYamlException) {
+  std::string bad_yaml = R"EOF(
+admin:
+  access_log_path: /dev/null
+  address:
+    socket_address:
+      address: {{ ntop_ip_loopback_address }}
+      port_value: 0
+)EOF";
+
+  EXPECT_THROW_WITH_REGEX(Json::Factory::loadFromYamlString(bad_yaml), EnvoyException,
+                          "bad conversion");
+  EXPECT_THROW_WITHOUT_REGEX(Json::Factory::loadFromYamlString(bad_yaml), EnvoyException,
+                             "Unexpected YAML exception");
 }
 
 } // namespace Json

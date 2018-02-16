@@ -58,7 +58,7 @@ TEST_P(LegacyJsonIntegrationTest, TestServerXfc) {
   param_map["set_current_client_cert_details"] = "";
   std::string config = TestEnvironment::temporaryFileSubstitute(
       "test/config/integration/server_xfcc.json", param_map, port_map_, version_);
-  IntegrationTestServer::create(config, version_);
+  IntegrationTestServer::create(config, version_, nullptr);
 }
 
 TEST_P(LegacyJsonIntegrationTest, TestEchoServer) {
@@ -67,10 +67,6 @@ TEST_P(LegacyJsonIntegrationTest, TestEchoServer) {
 
 TEST_P(LegacyJsonIntegrationTest, TestServerGrpcJsonTranscoder) {
   createTestServer("test/config/integration/server_grpc_json_transcoder.json", {"http"});
-}
-
-TEST_P(LegacyJsonIntegrationTest, TestServerRatelimit) {
-  createTestServer("test/config/integration/server_ratelimit.json", {"http"});
 }
 
 INSTANTIATE_TEST_CASE_P(IpVersions, LegacyJsonIntegrationTest,

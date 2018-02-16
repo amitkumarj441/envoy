@@ -6,17 +6,14 @@
 #include <vector>
 
 #include "common/common/assert.h"
-#include "common/common/enum_to_int.h"
-#include "common/http/codes.h"
-#include "common/json/config_schemas.h"
 
 namespace Envoy {
 namespace Redis {
 namespace ConnPool {
 
-ConfigImpl::ConfigImpl(const Json::Object& config)
-    : Validator(config, Json::Schema::REDIS_CONN_POOL_SCHEMA),
-      op_timeout_(config.getInteger("op_timeout_ms")) {}
+ConfigImpl::ConfigImpl(
+    const envoy::config::filter::network::redis_proxy::v2::RedisProxy::ConnPoolSettings& config)
+    : op_timeout_(PROTOBUF_GET_MS_REQUIRED(config, op_timeout)) {}
 
 ClientPtr ClientImpl::create(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
                              EncoderPtr&& encoder, DecoderFactory& decoder_factory,
@@ -24,7 +21,7 @@ ClientPtr ClientImpl::create(Upstream::HostConstSharedPtr host, Event::Dispatche
 
   std::unique_ptr<ClientImpl> client(
       new ClientImpl(host, dispatcher, std::move(encoder), decoder_factory, config));
-  client->connection_ = host->createConnection(dispatcher).connection_;
+  client->connection_ = host->createConnection(dispatcher, nullptr).connection_;
   client->connection_->addConnectionCallbacks(*client);
   client->connection_->addReadFilter(Network::ReadFilterSharedPtr{new UpstreamReadFilter(*client)});
   client->connection_->connect();
@@ -38,8 +35,8 @@ ClientImpl::ClientImpl(Upstream::HostConstSharedPtr host, Event::Dispatcher& dis
       config_(config),
       connect_or_op_timer_(dispatcher.createTimer([this]() -> void { onConnectOrOpTimeout(); })) {
   host->cluster().stats().upstream_cx_total_.inc();
-  host->cluster().stats().upstream_cx_active_.inc();
   host->stats().cx_total_.inc();
+  host->cluster().stats().upstream_cx_active_.inc();
   host->stats().cx_active_.inc();
   connect_or_op_timer_->enableTimer(host->cluster().connectTimeout());
 }
@@ -55,14 +52,18 @@ void ClientImpl::close() { connection_->close(Network::ConnectionCloseType::NoFl
 
 PoolRequest* ClientImpl::makeRequest(const RespValue& request, PoolCallbacks& callbacks) {
   ASSERT(connection_->state() == Network::Connection::State::Open);
+
   pending_requests_.emplace_back(*this, callbacks);
   encoder_->encode(request, encoder_buffer_);
-  connection_->write(encoder_buffer_);
+  connection_->write(encoder_buffer_, false);
 
-  // Only boost the op timeout if we are not already connected. Otherwise, we are governed by
-  // the connect timeout and the timer will be reset when/if connection occurs. This allows a
-  // relatively long connection spin up time for example if TLS is being used.
-  if (connected_) {
+  // Only boost the op timeout if:
+  // - We are not already connected. Otherwise, we are governed by the connect timeout and the timer
+  //   will be reset when/if connection occurs. This allows a relatively long connection spin up
+  //   time for example if TLS is being used.
+  // - This is the first request on the pipeline. Otherwise the timeout would effectively start on
+  //   the last operation.
+  if (connected_ && pending_requests_.size() == 1) {
     connect_or_op_timer_->enableTimer(config_.opTimeout());
   }
 
@@ -70,11 +71,13 @@ PoolRequest* ClientImpl::makeRequest(const RespValue& request, PoolCallbacks& ca
 }
 
 void ClientImpl::onConnectOrOpTimeout() {
-  host_->outlierDetector().putHttpResponseCode(enumToInt(Http::Code::GatewayTimeout));
+  putOutlierEvent(Upstream::Outlier::Result::TIMEOUT);
   if (connected_) {
     host_->cluster().stats().upstream_rq_timeout_.inc();
+    host_->stats().rq_timeout_.inc();
   } else {
     host_->cluster().stats().upstream_cx_connect_timeout_.inc();
+    host_->stats().cx_connect_fail_.inc();
   }
 
   connection_->close(Network::ConnectionCloseType::NoFlush);
@@ -84,9 +87,16 @@ void ClientImpl::onData(Buffer::Instance& data) {
   try {
     decoder_->decode(data);
   } catch (ProtocolError&) {
-    host_->outlierDetector().putHttpResponseCode(enumToInt(Http::Code::InternalServerError));
+    putOutlierEvent(Upstream::Outlier::Result::REQUEST_FAILED);
     host_->cluster().stats().upstream_cx_protocol_error_.inc();
+    host_->stats().rq_error_.inc();
     connection_->close(Network::ConnectionCloseType::NoFlush);
+  }
+}
+
+void ClientImpl::putOutlierEvent(Upstream::Outlier::Result result) {
+  if (!config_.disableOutlierEvents()) {
+    host_->outlierDetector().putResult(result);
   }
 }
 
@@ -96,7 +106,7 @@ void ClientImpl::onEvent(Network::ConnectionEvent event) {
     if (!pending_requests_.empty()) {
       host_->cluster().stats().upstream_cx_destroy_with_active_rq_.inc();
       if (event == Network::ConnectionEvent::RemoteClose) {
-        host_->outlierDetector().putHttpResponseCode(enumToInt(Http::Code::ServiceUnavailable));
+        putOutlierEvent(Upstream::Outlier::Result::SERVER_FAILURE);
         host_->cluster().stats().upstream_cx_destroy_remote_with_active_rq_.inc();
       }
       if (event == Network::ConnectionEvent::LocalClose) {
@@ -137,20 +147,22 @@ void ClientImpl::onRespValue(RespValuePtr&& value) {
   }
   pending_requests_.pop_front();
 
-  // We boost the op timeout every time we pipeline a new op. However, if there are no remaining
-  // ops in the pipeline we need to disable the timer.
+  // If there are no remaining ops in the pipeline we need to disable the timer.
+  // Otherwise we boost the timer since we are receiving responses and there are more to flush out.
   if (pending_requests_.empty()) {
     connect_or_op_timer_->disableTimer();
+  } else {
+    connect_or_op_timer_->enableTimer(config_.opTimeout());
   }
 
-  host_->outlierDetector().putHttpResponseCode(enumToInt(Http::Code::OK));
+  putOutlierEvent(Upstream::Outlier::Result::SUCCESS);
 }
 
 ClientImpl::PendingRequest::PendingRequest(ClientImpl& parent, PoolCallbacks& callbacks)
     : parent_(parent), callbacks_(callbacks) {
   parent.host_->cluster().stats().upstream_rq_total_.inc();
-  parent.host_->cluster().stats().upstream_rq_active_.inc();
   parent.host_->stats().rq_total_.inc();
+  parent.host_->cluster().stats().upstream_rq_active_.inc();
   parent.host_->stats().rq_active_.inc();
 }
 
@@ -174,9 +186,10 @@ ClientPtr ClientFactoryImpl::create(Upstream::HostConstSharedPtr host,
                             config);
 }
 
-InstanceImpl::InstanceImpl(const std::string& cluster_name, Upstream::ClusterManager& cm,
-                           ClientFactory& client_factory, ThreadLocal::SlotAllocator& tls,
-                           const Json::Object& config)
+InstanceImpl::InstanceImpl(
+    const std::string& cluster_name, Upstream::ClusterManager& cm, ClientFactory& client_factory,
+    ThreadLocal::SlotAllocator& tls,
+    const envoy::config::filter::network::redis_proxy::v2::RedisProxy::ConnPoolSettings& config)
     : cm_(cm), client_factory_(client_factory), tls_(tls.allocateSlot()), config_(config) {
   tls_->set([this, cluster_name](
                 Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
@@ -197,8 +210,8 @@ InstanceImpl::ThreadLocalPool::ThreadLocalPool(InstanceImpl& parent, Event::Disp
   //                     we will need to add thread local cluster removal callbacks so that we can
   //                     safely clean things up and fail requests.
   ASSERT(!cluster_->info()->addedViaApi());
-  local_host_set_member_update_cb_handle_ = cluster_->hostSet().addMemberUpdateCb(
-      [this](const std::vector<Upstream::HostSharedPtr>&,
+  local_host_set_member_update_cb_handle_ = cluster_->prioritySet().addMemberUpdateCb(
+      [this](uint32_t, const std::vector<Upstream::HostSharedPtr>&,
              const std::vector<Upstream::HostSharedPtr>& hosts_removed) -> void {
         onHostsRemoved(hosts_removed);
       });

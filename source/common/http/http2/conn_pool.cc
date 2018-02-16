@@ -15,8 +15,9 @@ namespace Http {
 namespace Http2 {
 
 ConnPoolImpl::ConnPoolImpl(Event::Dispatcher& dispatcher, Upstream::HostConstSharedPtr host,
-                           Upstream::ResourcePriority priority)
-    : dispatcher_(dispatcher), host_(host), priority_(priority) {}
+                           Upstream::ResourcePriority priority,
+                           const Network::ConnectionSocket::OptionsSharedPtr& options)
+    : dispatcher_(dispatcher), host_(host), priority_(priority), socket_options_(options) {}
 
 ConnPoolImpl::~ConnPoolImpl() {
   if (primary_client_) {
@@ -29,6 +30,12 @@ ConnPoolImpl::~ConnPoolImpl() {
 
   // Make sure all clients are destroyed before we are destroyed.
   dispatcher_.clearDeferredDeleteList();
+}
+
+void ConnPoolImpl::ConnPoolImpl::drainConnections() {
+  if (primary_client_ != nullptr) {
+    movePrimaryClientToDraining();
+  }
 }
 
 void ConnPoolImpl::addDrainedCallback(DrainedCb cb) {
@@ -212,9 +219,10 @@ ConnPoolImpl::ActiveClient::ActiveClient(ConnPoolImpl& parent)
     : parent_(parent),
       connect_timer_(parent_.dispatcher_.createTimer([this]() -> void { onConnectTimeout(); })) {
 
-  parent_.conn_connect_ms_ =
-      parent_.host_->cluster().stats().upstream_cx_connect_ms_.allocateSpan();
-  Upstream::Host::CreateConnectionData data = parent_.host_->createConnection(parent_.dispatcher_);
+  parent_.conn_connect_ms_.reset(
+      new Stats::Timespan(parent_.host_->cluster().stats().upstream_cx_connect_ms_));
+  Upstream::Host::CreateConnectionData data =
+      parent_.host_->createConnection(parent_.dispatcher_, parent_.socket_options_);
   real_host_description_ = data.host_description_;
   client_ = parent_.createCodecClient(data);
   client_->addConnectionCallbacks(*this);
@@ -227,7 +235,7 @@ ConnPoolImpl::ActiveClient::ActiveClient(ConnPoolImpl& parent)
   parent_.host_->cluster().stats().upstream_cx_total_.inc();
   parent_.host_->cluster().stats().upstream_cx_active_.inc();
   parent_.host_->cluster().stats().upstream_cx_http2_total_.inc();
-  conn_length_ = parent_.host_->cluster().stats().upstream_cx_length_ms_.allocateSpan();
+  conn_length_.reset(new Stats::Timespan(parent_.host_->cluster().stats().upstream_cx_length_ms_));
 
   client_->setConnectionStats({parent_.host_->cluster().stats().upstream_cx_rx_bytes_total_,
                                parent_.host_->cluster().stats().upstream_cx_rx_bytes_buffered_,

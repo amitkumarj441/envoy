@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <string>
 
+#include "common/common/fmt.h"
 #include "common/config/protocol_json.h"
 #include "common/http/exception.h"
 #include "common/http/header_map_impl.h"
@@ -11,7 +12,6 @@
 #include "test/test_common/printers.h"
 #include "test/test_common/utility.h"
 
-#include "fmt/format.h"
 #include "gtest/gtest.h"
 
 using testing::InvokeWithoutArgs;
@@ -37,29 +37,6 @@ TEST(HttpUtility, parseQueryString) {
 TEST(HttpUtility, getResponseStatus) {
   EXPECT_THROW(Utility::getResponseStatus(TestHeaderMapImpl{}), CodecClientException);
   EXPECT_EQ(200U, Utility::getResponseStatus(TestHeaderMapImpl{{":status", "200"}}));
-}
-
-TEST(HttpUtility, isInternalRequest) {
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{}));
-  EXPECT_FALSE(
-      Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "10.0.0.1,10.0.0.2"}}));
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "50.0.0.1"}}));
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "blah"}}));
-
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "10.0.0.0"}}));
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "10.255.255.255"}}));
-
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "172.0.0.0"}}));
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "172.16.0.0"}}));
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "172.31.255.255"}}));
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "172.32.0.0"}}));
-
-  EXPECT_FALSE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "192.0.0.0"}}));
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "192.168.0.0"}}));
-  EXPECT_TRUE(
-      Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "192.168.255.255"}}));
-
-  EXPECT_TRUE(Utility::isInternalRequest(TestHeaderMapImpl{{"x-forwarded-for", "127.0.0.1"}}));
 }
 
 TEST(HttpUtility, isWebSocketUpgradeRequest) {
@@ -110,7 +87,7 @@ TEST(HttpUtility, createSslRedirectPath) {
 namespace {
 
 Http2Settings parseHttp2SettingsFromJson(const std::string& json_string) {
-  envoy::api::v2::Http2ProtocolOptions http2_protocol_options;
+  envoy::api::v2::core::Http2ProtocolOptions http2_protocol_options;
   auto json_object_ptr = Json::Factory::loadFromString(json_string);
   Config::ProtocolJson::translateHttp2ProtocolOptions(
       *json_object_ptr->getObject("http2_settings", true), http2_protocol_options);
@@ -147,30 +124,62 @@ TEST(HttpUtility, parseHttp2Settings) {
   }
 }
 
-TEST(HttpUtility, TwoAddressesInXFF) {
-  const std::string first_address = "34.0.0.1";
-  const std::string second_address = "10.0.0.1";
-  TestHeaderMapImpl request_headers{
-      {"x-forwarded-for", fmt::format("{0}, {0}, {1}", first_address, second_address)}};
-  EXPECT_EQ(second_address, Utility::getLastAddressFromXFF(request_headers));
-}
-
-TEST(HttpUtility, EmptyXFF) {
+TEST(HttpUtility, getLastAddressFromXFF) {
+  {
+    const std::string first_address = "192.0.2.10";
+    const std::string second_address = "192.0.2.1";
+    const std::string third_address = "10.0.0.1";
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", "192.0.2.10, 192.0.2.1, 10.0.0.1"}};
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(third_address, ret.address_->ip()->addressAsString());
+    EXPECT_FALSE(ret.single_address_);
+    ret = Utility::getLastAddressFromXFF(request_headers, 1);
+    EXPECT_EQ(second_address, ret.address_->ip()->addressAsString());
+    EXPECT_FALSE(ret.single_address_);
+    ret = Utility::getLastAddressFromXFF(request_headers, 2);
+    EXPECT_EQ(first_address, ret.address_->ip()->addressAsString());
+    EXPECT_FALSE(ret.single_address_);
+    ret = Utility::getLastAddressFromXFF(request_headers, 3);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
+  }
   {
     TestHeaderMapImpl request_headers{{"x-forwarded-for", ""}};
-    EXPECT_EQ("", Utility::getLastAddressFromXFF(request_headers));
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
   }
-
+  {
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", ","}};
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
+  }
+  {
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", ", "}};
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
+  }
+  {
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", ", bad"}};
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
+  }
   {
     TestHeaderMapImpl request_headers;
-    EXPECT_EQ("", Utility::getLastAddressFromXFF(request_headers));
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(nullptr, ret.address_);
+    EXPECT_FALSE(ret.single_address_);
   }
-}
-
-TEST(HttpUtility, OneAddressInXFF) {
-  const std::string first_address = "34.0.0.1";
-  TestHeaderMapImpl request_headers{{"x-forwarded-for", first_address}};
-  EXPECT_EQ(first_address, Utility::getLastAddressFromXFF(request_headers));
+  {
+    const std::string first_address = "34.0.0.1";
+    TestHeaderMapImpl request_headers{{"x-forwarded-for", first_address}};
+    auto ret = Utility::getLastAddressFromXFF(request_headers);
+    EXPECT_EQ(first_address, ret.address_->ip()->addressAsString());
+    EXPECT_TRUE(ret.single_address_);
+  }
 }
 
 TEST(HttpUtility, TestParseCookie) {
@@ -208,6 +217,27 @@ TEST(HttpUtility, TestParseCookieWithQuotes) {
   EXPECT_EQ(Utility::parseCookieValue(headers, "dquote"), "\"");
   EXPECT_EQ(Utility::parseCookieValue(headers, "quoteddquote"), "\"");
   EXPECT_EQ(Utility::parseCookieValue(headers, "leadingdquote"), "\"foobar");
+}
+
+TEST(HttpUtility, TestHasSetCookie) {
+  TestHeaderMapImpl headers{{"someheader", "10.0.0.1"},
+                            {"set-cookie", "somekey=somevalue"},
+                            {"set-cookie", "abc=def; Expires=Wed, 09 Jun 2021 10:18:14 GMT"},
+                            {"set-cookie", "key2=value2; Secure"}};
+
+  EXPECT_TRUE(Utility::hasSetCookie(headers, "abc"));
+  EXPECT_TRUE(Utility::hasSetCookie(headers, "somekey"));
+  EXPECT_FALSE(Utility::hasSetCookie(headers, "ghi"));
+}
+
+TEST(HttpUtility, TestHasSetCookieBadValues) {
+  TestHeaderMapImpl headers{{"someheader", "10.0.0.1"},
+                            {"set-cookie", "somekey =somevalue"},
+                            {"set-cookie", "abc"},
+                            {"set-cookie", "key2=value2; Secure"}};
+
+  EXPECT_FALSE(Utility::hasSetCookie(headers, "abc"));
+  EXPECT_TRUE(Utility::hasSetCookie(headers, "key2"));
 }
 
 TEST(HttpUtility, SendLocalReply) {

@@ -16,7 +16,6 @@ exports_files([
     "server_http2.json",
     "server_http2_upstream.json",
     "server_proxy_proto.json",
-    "server_ratelimit.json",
     "server_ssl.json",
     "server_uds.json",
     "server_xfcc.json",
@@ -39,4 +38,9 @@ filegroup(
     srcs = [
         "server.json",
     ],
+)
+
+filegroup(
+    name = "google_com_proxy_port_0",
+    srcs = ["google_com_proxy_port_0.v2.yaml"],
 )

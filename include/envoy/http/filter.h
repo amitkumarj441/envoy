@@ -5,8 +5,8 @@
 #include <memory>
 #include <string>
 
+#include "envoy/access_log/access_log.h"
 #include "envoy/event/dispatcher.h"
-#include "envoy/http/access_log.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/header_map.h"
 #include "envoy/router/router.h"
@@ -47,7 +47,7 @@ enum class FilterDataStatus {
   // continuing processing and so can not push back on streaming data via watermarks.
   //
   // If buffering the request causes buffered data to exceed the configured buffer limit, a 413 will
-  // be sent to the user.  On the response path exceeding buffer limits will result in a 500.
+  // be sent to the user. On the response path exceeding buffer limits will result in a 500.
   StopIterationAndBuffer,
   // Do not iterate to any of the remaining filters in the chain, and buffer body data for later
   // dispatching. Returning FilterDataStatus::Continue from decodeData()/encodeData() or calling
@@ -126,7 +126,7 @@ public:
    * @return requestInfo for logging purposes. Individual filter may add specific information to be
    * put into the access log.
    */
-  virtual AccessLog::RequestInfo& requestInfo() PURE;
+  virtual RequestInfo::RequestInfo& requestInfo() PURE;
 
   /**
    * @return span context used for tracing purposes. Individual filters may add or modify
@@ -135,9 +135,9 @@ public:
   virtual Tracing::Span& activeSpan() PURE;
 
   /**
-   * @return the trusted downstream address for the connection.
+   * @return tracing configuration.
    */
-  virtual const std::string& downstreamAddress() PURE;
+  virtual const Tracing::Config& tracingConfig() PURE;
 };
 
 /**
@@ -172,10 +172,14 @@ public:
    * decodeHeaders(..., false) followed by decodeData(..., true). This works both in the direct
    * iteration as well as the continuation case.
    *
-   * 2) If additional buffered body data needs to be added by a filter before continuation of
-   * data to further filters (outside of callback context).
+   * 2) If a filter is going to look at all buffered data from within a data callback with end
+   * stream set, this method can be called to immediately buffer the data. This avoids having
+   * to deal with the existing buffered data and the data from the current callback.
    *
-   * 3) If additional data needs to be added in the decodeTrailers() callback, this method can be
+   * 3) If additional buffered body data needs to be added by a filter before continuation of data
+   * to further filters (outside of callback context).
+   *
+   * 4) If additional data needs to be added in the decodeTrailers() callback, this method can be
    * called in the context of the callback. All further filters will receive decodeData(..., false)
    * followed by decodeTrailers().
    *
@@ -185,6 +189,17 @@ public:
    * @param streaming_filter boolean supplies if this filter streams data or buffers the full body.
    */
   virtual void addDecodedData(Buffer::Instance& data, bool streaming_filter) PURE;
+
+  /**
+   * Called with 100-Continue headers to be encoded.
+   *
+   * This is not folded into encodeHeaders because most Envoy users and filters
+   * will not be proxying 100-continue and with it split out, can ignore the
+   * complexity of multiple encodeHeaders calls.
+   *
+   * @param headers supplies the headers to be encoded.
+   */
+  virtual void encode100ContinueHeaders(HeaderMapPtr&& headers) PURE;
 
   /**
    * Called with headers to be encoded, optionally indicating end of stream.
@@ -215,7 +230,7 @@ public:
    * their high watermark.
    *
    * In the case of a filter such as the router filter, which spills into multiple buffers (codec,
-   * connection etc.) this may be called multiple times.  Any such filter is responsible for calling
+   * connection etc.) this may be called multiple times. Any such filter is responsible for calling
    * the low watermark callbacks an equal number of times as the respective buffers are drained.
    */
   virtual void onDecoderFilterAboveWriteBufferHighWatermark() PURE;
@@ -347,10 +362,14 @@ public:
    * encodeHeaders(..., false) followed by encodeData(..., true). This works both in the direct
    * iteration as well as the continuation case.
    *
-   * 2) If additional buffered body data needs to be added by a filter before continuation of
-   * data to further filters (outside of callback context).
+   * 2) If a filter is going to look at all buffered data from within a data callback with end
+   * stream set, this method can be called to immediately buffer the data. This avoids having
+   * to deal with the existing buffered data and the data from the current callback.
    *
-   * 3) If additional data needs to be added in the encodeTrailers() callback, this method can be
+   * 3) If additional buffered body data needs to be added by a filter before continuation of data
+   * to further filters (outside of callback context).
+   *
+   * 4) If additional data needs to be added in the encodeTrailers() callback, this method can be
    * called in the context of the callback. All further filters will receive encodeData(..., false)
    * followed by encodeTrailers().
    *
@@ -393,6 +412,19 @@ public:
  */
 class StreamEncoderFilter : public StreamFilterBase {
 public:
+  /*
+   * Called with 100-continue headers.
+   *
+   * This is not folded into encodeHeaders because most Envoy users and filters
+   * will not be proxying 100-continue and with it split out, can ignore the
+   * complexity of multiple encodeHeaders calls.
+   *
+   * @param headers supplies the 100-continue response headers to be encoded.
+   * @return FilterHeadersStatus determines how filter chain iteration proceeds.
+   *
+   */
+  virtual FilterHeadersStatus encode100ContinueHeaders(HeaderMap& headers) PURE;
+
   /**
    * Called with headers to be encoded, optionally indicating end of stream.
    * @param headers supplies the headers to be encoded.
@@ -461,7 +493,7 @@ public:
    * Add an access log handler that is called when the stream is destroyed.
    * @param handler supplies the handler to add.
    */
-  virtual void addAccessLogHandler(Http::AccessLog::InstanceSharedPtr handler) PURE;
+  virtual void addAccessLogHandler(AccessLog::InstanceSharedPtr handler) PURE;
 };
 
 /**

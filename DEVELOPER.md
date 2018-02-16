@@ -4,9 +4,11 @@ Envoy is built using the Bazel build system. Travis CI builds, tests, and runs c
 
 To get started building Envoy locally, see the [Bazel quick start](https://github.com/envoyproxy/envoy/blob/master/bazel/README.md#quick-start-bazel-build-for-developers). To run tests, there are Bazel [targets](https://github.com/envoyproxy/envoy/blob/master/bazel/README.md#testing-envoy-with-bazel) for Google Test. To generate a coverage report, use the tooling for [gcovr](https://github.com/envoyproxy/envoy/blob/master/bazel/README.md#coverage-builds).
 
+If you plan to contribute to Envoy, you may find it useful to install the Envoy [development support toolchain](https://github.com/envoyproxy/envoy/blob/master/support/README.md), which helps automate parts of the development process, particularly those involving code review.
+
 Below is a list of additional documentation to aid the development process:
 
-- [General build and installation documentation](https://envoyproxy.github.io/envoy/install/install.html)
+- [General build and installation documentation](https://www.envoyproxy.io/docs/envoy/latest/install/install)
 
 - [Building and testing Envoy with Bazel](https://github.com/envoyproxy/envoy/blob/master/bazel/README.md)
 
@@ -18,4 +20,13 @@ Below is a list of additional documentation to aid the development process:
 
 - [Guide to contributing to Envoy](https://github.com/envoyproxy/envoy/blob/master/CONTRIBUTING.md)
 
+- [Overview of how to write integration tests for new code](https://github.com/envoyproxy/envoy/blob/master/test/integration/README.md)
+
 - [Envoy filter example project (how to consume and extend Envoy as a submodule)](https://github.com/envoyproxy/envoy-filter-example)
+
+And some documents on components of Envoy architecture:
+
+- [Envoy flow control](https://github.com/envoyproxy/envoy/blob/master/source/docs/flow_control.md)
+
+- [Envoy's subset load balancer](https://github.com/envoyproxy/envoy/blob/master/source/docs/subset_load_balancer.md)
+

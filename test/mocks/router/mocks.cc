@@ -7,6 +7,7 @@
 
 using testing::NiceMock;
 using testing::Return;
+using testing::ReturnPointee;
 using testing::ReturnRef;
 using testing::SaveArg;
 using testing::_;
@@ -14,8 +15,8 @@ using testing::_;
 namespace Envoy {
 namespace Router {
 
-MockRedirectEntry::MockRedirectEntry() {}
-MockRedirectEntry::~MockRedirectEntry() {}
+MockDirectResponseEntry::MockDirectResponseEntry() {}
+MockDirectResponseEntry::~MockDirectResponseEntry() {}
 
 MockRetryState::MockRetryState() {}
 
@@ -52,6 +53,16 @@ MockVirtualHost::~MockVirtualHost() {}
 MockHashPolicy::MockHashPolicy() {}
 MockHashPolicy::~MockHashPolicy() {}
 
+MockMetadataMatchCriteria::MockMetadataMatchCriteria() {}
+MockMetadataMatchCriteria::~MockMetadataMatchCriteria() {}
+
+MockPathMatchCriterion::MockPathMatchCriterion() {
+  ON_CALL(*this, matchType()).WillByDefault(ReturnPointee(&type_));
+  ON_CALL(*this, matcher()).WillByDefault(ReturnPointee(&matcher_));
+}
+
+MockPathMatchCriterion::~MockPathMatchCriterion() {}
+
 MockRouteEntry::MockRouteEntry() {
   ON_CALL(*this, clusterName()).WillByDefault(ReturnRef(cluster_name_));
   ON_CALL(*this, opaqueConfig()).WillByDefault(ReturnRef(opaque_config_));
@@ -62,6 +73,7 @@ MockRouteEntry::MockRouteEntry() {
   ON_CALL(*this, virtualCluster(_)).WillByDefault(Return(&virtual_cluster_));
   ON_CALL(*this, virtualHost()).WillByDefault(ReturnRef(virtual_host_));
   ON_CALL(*this, includeVirtualHostRateLimits()).WillByDefault(Return(true));
+  ON_CALL(*this, pathMatchCriterion()).WillByDefault(ReturnRef(path_match_criterion_));
 }
 
 MockRouteEntry::~MockRouteEntry() {}
@@ -69,13 +81,14 @@ MockRouteEntry::~MockRouteEntry() {}
 MockConfig::MockConfig() : route_(new NiceMock<MockRoute>()) {
   ON_CALL(*this, route(_, _)).WillByDefault(Return(route_));
   ON_CALL(*this, internalOnlyHeaders()).WillByDefault(ReturnRef(internal_only_headers_));
-  ON_CALL(*this, responseHeadersToAdd()).WillByDefault(ReturnRef(response_headers_to_add_));
-  ON_CALL(*this, responseHeadersToRemove()).WillByDefault(ReturnRef(response_headers_to_remove_));
+  ON_CALL(*this, name()).WillByDefault(ReturnRef(name_));
 }
 
 MockConfig::~MockConfig() {}
 
-MockDecorator::MockDecorator() { ON_CALL(*this, operation()).WillByDefault(ReturnRef(operation_)); }
+MockDecorator::MockDecorator() {
+  ON_CALL(*this, getOperation()).WillByDefault(ReturnRef(operation_));
+}
 MockDecorator::~MockDecorator() {}
 
 MockRoute::MockRoute() {

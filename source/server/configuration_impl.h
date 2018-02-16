@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "envoy/config/bootstrap/v2/bootstrap.pb.h"
+#include "envoy/config/trace/v2/trace.pb.h"
 #include "envoy/http/filter.h"
 #include "envoy/network/filter.h"
 #include "envoy/server/configuration.h"
@@ -18,11 +20,10 @@
 
 #include "common/common/logger.h"
 #include "common/json/json_loader.h"
+#include "common/network/resolver_impl.h"
 #include "common/network/utility.h"
 
 #include "server/lds_api.h"
-
-#include "api/bootstrap.pb.h"
 
 namespace Envoy {
 namespace Server {
@@ -37,9 +38,9 @@ public:
   virtual ~HttpTracerFactory() {}
 
   /**
-   * Create a particular HttpTracer implementation.  If the implementation is unable to produce an
+   * Create a particular HttpTracer implementation. If the implementation is unable to produce an
    * HttpTracer with the provided parameters, it should throw an EnvoyException in the case of
-   * general error or a Json::Exception if the json configuration is erroneous.  The returned
+   * general error or a Json::Exception if the json configuration is erroneous. The returned
    * pointer should always be valid.
    * @param json_config supplies the general json configuration for the HttpTracer
    * @param server supplies the server instance
@@ -97,6 +98,13 @@ public:
    */
   static bool buildFilterChain(Network::FilterManager& filter_manager,
                                const std::vector<NetworkFilterFactoryCb>& factories);
+
+  /**
+   * Given a ListenerFilterManager and a list of factories, create a new filter chain. Chain
+   * creation will exit early if any filters immediately close the connection.
+   */
+  static bool buildFilterChain(Network::ListenerFilterManager& filter_manager,
+                               const std::vector<ListenerFilterFactoryCb>& factories);
 };
 
 /**
@@ -112,7 +120,7 @@ public:
    * @param server supplies the owning server.
    * @param cluster_manager_factory supplies the cluster manager creation factory.
    */
-  void initialize(const envoy::api::v2::Bootstrap& bootstrap, Instance& server,
+  void initialize(const envoy::config::bootstrap::v2::Bootstrap& bootstrap, Instance& server,
                   Upstream::ClusterManagerFactory& cluster_manager_factory);
 
   // Server::Configuration::Main
@@ -134,9 +142,10 @@ private:
   /**
    * Initialize tracers and corresponding sinks.
    */
-  void initializeTracers(const envoy::api::v2::Tracing& configuration, Instance& server);
+  void initializeTracers(const envoy::config::trace::v2::Tracing& configuration, Instance& server);
 
-  void initializeStatsSinks(const envoy::api::v2::Bootstrap& bootstrap, Instance& server);
+  void initializeStatsSinks(const envoy::config::bootstrap::v2::Bootstrap& bootstrap,
+                            Instance& server);
 
   std::unique_ptr<Upstream::ClusterManager> cluster_manager_;
   std::unique_ptr<LdsApi> lds_api_;
@@ -155,7 +164,7 @@ private:
  */
 class InitialImpl : public Initial {
 public:
-  InitialImpl(const envoy::api::v2::Bootstrap& bootstrap);
+  InitialImpl(const envoy::config::bootstrap::v2::Bootstrap& bootstrap);
 
   // Server::Configuration::Initial
   Admin& admin() override { return admin_; }

@@ -1,14 +1,14 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
+#include "envoy/api/v2/core/protocol.pb.h"
 #include "envoy/http/codes.h"
 #include "envoy/http/filter.h"
 
 #include "common/json/json_loader.h"
-
-#include "api/protocol.pb.h"
 
 namespace Envoy {
 namespace Http {
@@ -58,20 +58,29 @@ public:
   static std::string parseCookieValue(const HeaderMap& headers, const std::string& key);
 
   /**
+   * Check whether a Set-Cookie header for the given cookie name exists
+   * @param headers supplies the headers to search for the cookie
+   * @param key the name of the cookie to search for
+   * @return bool true if the cookie is set, false otherwise
+   */
+  static bool hasSetCookie(const HeaderMap& headers, const std::string& key);
+
+  /**
+   * Produce the value for a Set-Cookie header with the given parameters.
+   * @param key is the name of the cookie that is being set.
+   * @param value the value to set the cookie to; this value is trusted.
+   * @param max_age the length of time for which the cookie is valid.
+   * @return std::string a valid Set-Cookie header value string
+   */
+  static std::string makeSetCookieValue(const std::string& key, const std::string& value,
+                                        const std::chrono::seconds max_age);
+
+  /**
    * Get the response status from the response headers.
    * @param headers supplies the headers to get the status from.
    * @return uint64_t the response code or throws an exception if the headers are invalid.
    */
   static uint64_t getResponseStatus(const HeaderMap& headers);
-
-  /**
-   * Determine whether this is an internal origin request by parsing out x-forwarded-for from
-   * HTTP headers. Currently this returns true IFF the following holds true:
-   * - There is a single XFF header
-   * - There is a single address in the single XFF header
-   * - The address is an RFC1918 address.
-   */
-  static bool isInternalRequest(const HeaderMap& headers);
 
   /**
    * Determine whether this is a WebSocket Upgrade request.
@@ -82,16 +91,16 @@ public:
   static bool isWebSocketUpgradeRequest(const HeaderMap& headers);
 
   /**
-   * @return Http2Settings An Http2Settings populated from the envoy::api::v2::Http2ProtocolOptions
-   *         config.
+   * @return Http2Settings An Http2Settings populated from the
+   * envoy::api::v2::core::Http2ProtocolOptions config.
    */
-  static Http2Settings parseHttp2Settings(const envoy::api::v2::Http2ProtocolOptions& config);
+  static Http2Settings parseHttp2Settings(const envoy::api::v2::core::Http2ProtocolOptions& config);
 
   /**
-   * @return Http1Settings An Http1Settings populated from the envoy::api::v2::Http1ProtocolOptions
-   *         config.
+   * @return Http1Settings An Http1Settings populated from the
+   * envoy::api::v2::core::Http1ProtocolOptions config.
    */
-  static Http1Settings parseHttp1Settings(const envoy::api::v2::Http1ProtocolOptions& config);
+  static Http1Settings parseHttp1Settings(const envoy::api::v2::core::Http1ProtocolOptions& config);
 
   /**
    * Create a locally generated response using filter callbacks.
@@ -121,19 +130,30 @@ public:
                  std::function<void(Buffer::Instance& data, bool end_stream)> encode_data,
                  const bool& is_reset, Code response_code, const std::string& body_text);
 
-  /**
-   * Send a redirect response (301).
-   * @param callbacks supplies the filter callbacks to use.
-   * @param new_path supplies the redirect target.
-   */
-  static void sendRedirect(StreamDecoderFilterCallbacks& callbacks, const std::string& new_path);
+  struct GetLastAddressFromXffInfo {
+    // Last valid address pulled from the XFF header.
+    Network::Address::InstanceConstSharedPtr address_;
+    // Whether this is the only address in the XFF header.
+    bool single_address_;
+  };
 
   /**
-   * Retrieves the last address in x-forwarded-for header. If it isn't set, returns empty string.
-   * @param request_headers
-   * @return last_address_in_xff
+   * Retrieves the last IPv4/IPv6 address in the x-forwarded-for header.
+   * @param request_headers supplies the request headers.
+   * @param num_to_skip specifies the number of addresses at the end of the XFF header
+   *        to ignore when identifying the "last" address.
+   * @return GetLastAddressFromXffInfo information about the last address in the XFF header.
+   *         @see GetLastAddressFromXffInfo for more information.
    */
-  static std::string getLastAddressFromXFF(const Http::HeaderMap& request_headers);
+  static GetLastAddressFromXffInfo getLastAddressFromXFF(const Http::HeaderMap& request_headers,
+                                                         uint32_t num_to_skip = 0);
+
+  /**
+   * Get the string for the given http protocol.
+   * @param protocol for which to return the string representation.
+   * @return string representation of the protocol.
+   */
+  static const std::string& getProtocolString(const Protocol p);
 };
 
 } // namespace Http

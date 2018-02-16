@@ -11,8 +11,10 @@
 #include "envoy/server/filter_config.h"
 #include "envoy/server/instance.h"
 #include "envoy/server/options.h"
+#include "envoy/server/transport_socket_config.h"
 #include "envoy/server/worker.h"
 #include "envoy/ssl/context_manager.h"
+#include "envoy/thread/thread.h"
 
 #include "common/ssl/context_manager_impl.h"
 #include "common/stats/stats_impl.h"
@@ -46,10 +48,12 @@ public:
   MOCK_METHOD0(baseId, uint64_t());
   MOCK_METHOD0(concurrency, uint32_t());
   MOCK_METHOD0(configPath, const std::string&());
+  MOCK_METHOD0(v2ConfigOnly, bool());
   MOCK_METHOD0(adminAddressPath, const std::string&());
   MOCK_METHOD0(localAddressIpVersion, Network::Address::IpVersion());
   MOCK_METHOD0(drainTime, std::chrono::seconds());
   MOCK_METHOD0(logLevel, spdlog::level::level_enum());
+  MOCK_METHOD0(logPath, const std::string&());
   MOCK_METHOD0(parentShutdownTime, std::chrono::seconds());
   MOCK_METHOD0(restartEpoch, uint64_t());
   MOCK_METHOD0(fileFlushIntervalMsec, std::chrono::milliseconds());
@@ -57,12 +61,18 @@ public:
   MOCK_METHOD0(serviceClusterName, const std::string&());
   MOCK_METHOD0(serviceNodeName, const std::string&());
   MOCK_METHOD0(serviceZone, const std::string&());
+  MOCK_METHOD0(maxStats, uint64_t());
+  MOCK_METHOD0(maxObjNameLength, uint64_t());
+  MOCK_METHOD0(hotRestartDisabled, bool());
 
   std::string config_path_;
+  bool v2_config_only_{};
   std::string admin_address_path_;
   std::string service_cluster_name_;
   std::string service_node_name_;
   std::string service_zone_name_;
+  std::string log_path_;
+  bool hot_restart_disabled_{};
 };
 
 class MockAdmin : public Admin {
@@ -71,10 +81,10 @@ public:
   ~MockAdmin();
 
   // Server::Admin
-  MOCK_METHOD4(addHandler, bool(const std::string& prefix, const std::string& help_text,
-                                HandlerCb callback, bool removable));
+  MOCK_METHOD5(addHandler, bool(const std::string& prefix, const std::string& help_text,
+                                HandlerCb callback, bool removable, bool mutates_server_state));
   MOCK_METHOD1(removeHandler, bool(const std::string& prefix));
-  MOCK_METHOD0(socket, Network::ListenSocket&());
+  MOCK_METHOD0(socket, Network::Socket&());
 };
 
 class MockDrainManager : public DrainManager {
@@ -128,6 +138,14 @@ public:
   MOCK_METHOD0(terminateParent, void());
   MOCK_METHOD0(shutdown, void());
   MOCK_METHOD0(version, std::string());
+  MOCK_METHOD0(logLock, Thread::BasicLockable&());
+  MOCK_METHOD0(accessLogLock, Thread::BasicLockable&());
+  MOCK_METHOD0(statsAllocator, Stats::RawStatDataAllocator&());
+
+private:
+  Thread::MutexBasicLockable log_lock_;
+  Thread::MutexBasicLockable access_log_lock_;
+  Stats::HeapRawStatDataAllocator stats_allocator_;
 };
 
 class MockListenerComponentFactory : public ListenerComponentFactory {
@@ -135,16 +153,22 @@ public:
   MockListenerComponentFactory();
   ~MockListenerComponentFactory();
 
-  DrainManagerPtr createDrainManager() override { return DrainManagerPtr{createDrainManager_()}; }
+  DrainManagerPtr createDrainManager(envoy::api::v2::Listener::DrainType drain_type) override {
+    return DrainManagerPtr{createDrainManager_(drain_type)};
+  }
 
-  MOCK_METHOD2(createFilterFactoryList,
+  MOCK_METHOD2(createNetworkFilterFactoryList,
                std::vector<Configuration::NetworkFilterFactoryCb>(
-                   const Protobuf::RepeatedPtrField<envoy::api::v2::Filter>& filters,
+                   const Protobuf::RepeatedPtrField<envoy::api::v2::listener::Filter>& filters,
                    Configuration::FactoryContext& context));
+  MOCK_METHOD2(createListenerFilterFactoryList,
+               std::vector<Configuration::ListenerFilterFactoryCb>(
+                   const Protobuf::RepeatedPtrField<envoy::api::v2::listener::ListenerFilter>&,
+                   Configuration::ListenerFactoryContext& context));
   MOCK_METHOD2(createListenSocket,
-               Network::ListenSocketSharedPtr(Network::Address::InstanceConstSharedPtr address,
-                                              bool bind_to_port));
-  MOCK_METHOD0(createDrainManager_, DrainManager*());
+               Network::SocketSharedPtr(Network::Address::InstanceConstSharedPtr address,
+                                        bool bind_to_port));
+  MOCK_METHOD1(createDrainManager_, DrainManager*(envoy::api::v2::Listener::DrainType drain_type));
   MOCK_METHOD0(nextListenerTag, uint64_t());
 
   std::shared_ptr<Network::MockListenSocket> socket_;
@@ -155,35 +179,13 @@ public:
   MockListenerManager();
   ~MockListenerManager();
 
-  MOCK_METHOD1(addOrUpdateListener, bool(const envoy::api::v2::Listener& config));
-  MOCK_METHOD0(listeners, std::vector<std::reference_wrapper<Listener>>());
+  MOCK_METHOD2(addOrUpdateListener, bool(const envoy::api::v2::Listener& config, bool modifiable));
+  MOCK_METHOD0(listeners, std::vector<std::reference_wrapper<Network::ListenerConfig>>());
   MOCK_METHOD0(numConnections, uint64_t());
   MOCK_METHOD1(removeListener, bool(const std::string& listener_name));
   MOCK_METHOD1(startWorkers, void(GuardDog& guard_dog));
   MOCK_METHOD0(stopListeners, void());
   MOCK_METHOD0(stopWorkers, void());
-};
-
-class MockListener : public Listener {
-public:
-  MockListener();
-  ~MockListener();
-
-  MOCK_METHOD0(filterChainFactory, Network::FilterChainFactory&());
-  MOCK_METHOD0(socket, Network::ListenSocket&());
-  MOCK_METHOD0(sslContext, Ssl::ServerContext*());
-  MOCK_METHOD0(useProxyProto, bool());
-  MOCK_METHOD0(bindToPort, bool());
-  MOCK_METHOD0(useOriginalDst, bool());
-  MOCK_METHOD0(perConnectionBufferLimitBytes, uint32_t());
-  MOCK_METHOD0(listenerScope, Stats::Scope&());
-  MOCK_METHOD0(listenerTag, uint64_t());
-  MOCK_CONST_METHOD0(name, const std::string&());
-
-  testing::NiceMock<Network::MockFilterChainFactory> filter_chain_factory_;
-  testing::NiceMock<Network::MockListenSocket> socket_;
-  Stats::IsolatedStoreImpl scope_;
-  std::string name_;
 };
 
 class MockWorkerFactory : public WorkerFactory {
@@ -215,12 +217,14 @@ public:
   }
 
   // Server::Worker
-  MOCK_METHOD2(addListener, void(Listener& listener, AddListenerCompletion completion));
+  MOCK_METHOD2(addListener,
+               void(Network::ListenerConfig& listener, AddListenerCompletion completion));
   MOCK_METHOD0(numConnections, uint64_t());
-  MOCK_METHOD2(removeListener, void(Listener& listener, std::function<void()> completion));
+  MOCK_METHOD2(removeListener,
+               void(Network::ListenerConfig& listener, std::function<void()> completion));
   MOCK_METHOD1(start, void(GuardDog& guard_dog));
   MOCK_METHOD0(stop, void());
-  MOCK_METHOD1(stopListener, void(Listener& listener));
+  MOCK_METHOD1(stopListener, void(Network::ListenerConfig& listener));
   MOCK_METHOD0(stopListeners, void());
 
   AddListenerCompletion add_listener_completion_;
@@ -336,6 +340,8 @@ public:
   MOCK_METHOD0(singletonManager, Singleton::Manager&());
   MOCK_METHOD0(threadLocal, ThreadLocal::Instance&());
   MOCK_METHOD0(admin, Server::Admin&());
+  MOCK_METHOD0(listenerScope, Stats::Scope&());
+  MOCK_CONST_METHOD0(listenerMetadata, const envoy::api::v2::core::Metadata&());
 
   testing::NiceMock<AccessLog::MockAccessLogManager> access_log_manager_;
   testing::NiceMock<Upstream::MockClusterManager> cluster_manager_;
@@ -350,6 +356,24 @@ public:
   testing::NiceMock<ThreadLocal::MockInstance> thread_local_;
   Singleton::ManagerPtr singleton_manager_;
   testing::NiceMock<MockAdmin> admin_;
+  Stats::IsolatedStoreImpl listener_scope_;
+};
+
+class MockTransportSocketFactoryContext : public TransportSocketFactoryContext {
+public:
+  MockTransportSocketFactoryContext();
+  ~MockTransportSocketFactoryContext();
+
+  MOCK_METHOD0(sslContextManager, Ssl::ContextManager&());
+  MOCK_CONST_METHOD0(statsScope, Stats::Scope&());
+};
+
+class MockListenerFactoryContext : public MockFactoryContext {
+public:
+  MockListenerFactoryContext();
+  ~MockListenerFactoryContext();
+
+  MOCK_METHOD1(setListenSocketOptions, void(const Network::Socket::OptionsSharedPtr&));
 };
 
 } // namespace Configuration

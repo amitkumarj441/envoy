@@ -50,7 +50,7 @@ public:
   Buffer::OwnedImpl data_;
   TestHeaderMapImpl request_headers_;
   std::unique_ptr<Router::TestCorsPolicy> cors_policy_;
-  Router::MockRedirectEntry redirect_entry_;
+  Router::MockDirectResponseEntry direct_response_entry_;
 };
 
 TEST_F(CorsFilterTest, RequestWithoutOrigin) {
@@ -194,6 +194,23 @@ TEST_F(CorsFilterTest, OptionsRequestNotMatchingOrigin) {
   EXPECT_EQ(FilterTrailersStatus::Continue, filter_.encodeTrailers(request_headers_));
 }
 
+TEST_F(CorsFilterTest, OptionsRequestEmptyOriginList) {
+  Http::TestHeaderMapImpl request_headers{
+      {":method", "OPTIONS"}, {"origin", "test-host"}, {"access-control-request-method", "GET"}};
+
+  cors_policy_->allow_origin_.clear();
+
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(_, false)).Times(0);
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers, false));
+  EXPECT_EQ(false, IsCorsRequest());
+  EXPECT_EQ(FilterDataStatus::Continue, filter_.decodeData(data_, false));
+  EXPECT_EQ(FilterTrailersStatus::Continue, filter_.decodeTrailers(request_headers_));
+
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter_.encodeHeaders(request_headers_, false));
+  EXPECT_EQ(FilterDataStatus::Continue, filter_.encodeData(data_, false));
+  EXPECT_EQ(FilterTrailersStatus::Continue, filter_.encodeTrailers(request_headers_));
+}
+
 TEST_F(CorsFilterTest, ValidOptionsRequestWithAllowCredentialsTrue) {
   Http::TestHeaderMapImpl request_headers{
       {":method", "OPTIONS"}, {"origin", "localhost"}, {"access-control-request-method", "GET"}};
@@ -285,6 +302,9 @@ TEST_F(CorsFilterTest, EncodeWithAllowCredentialsTrue) {
   EXPECT_EQ(FilterDataStatus::Continue, filter_.decodeData(data_, false));
   EXPECT_EQ(FilterTrailersStatus::Continue, filter_.decodeTrailers(request_headers_));
 
+  Http::TestHeaderMapImpl continue_headers{{":status", "100"}};
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter_.encode100ContinueHeaders(continue_headers));
+
   Http::TestHeaderMapImpl response_headers{};
   EXPECT_EQ(FilterHeadersStatus::Continue, filter_.encodeHeaders(response_headers, false));
   EXPECT_EQ("localhost", response_headers.get_("access-control-allow-origin"));
@@ -329,7 +349,8 @@ TEST_F(CorsFilterTest, EncodeWithNonMatchingOrigin) {
 }
 
 TEST_F(CorsFilterTest, RedirectRoute) {
-  ON_CALL(*decoder_callbacks_.route_, redirectEntry()).WillByDefault(Return(&redirect_entry_));
+  ON_CALL(*decoder_callbacks_.route_, directResponseEntry())
+      .WillByDefault(Return(&direct_response_entry_));
 
   EXPECT_EQ(FilterHeadersStatus::Continue, filter_.decodeHeaders(request_headers_, false));
   EXPECT_EQ(FilterDataStatus::Continue, filter_.decodeData(data_, false));

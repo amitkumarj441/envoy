@@ -29,14 +29,17 @@ public:
   bool complete() { return saw_end_stream_; }
   bool reset() { return saw_reset_; }
   Http::StreamResetReason reset_reason() { return reset_reason_; }
+  const Http::HeaderMap* continue_headers() { return continue_headers_.get(); }
   const Http::HeaderMap& headers() { return *headers_; }
   const Http::HeaderMapPtr& trailers() { return trailers_; }
+  void waitForContinueHeaders();
   void waitForHeaders();
   void waitForBodyData(uint64_t size);
   void waitForEndStream();
   void waitForReset();
 
   // Http::StreamDecoder
+  void decode100ContinueHeaders(Http::HeaderMapPtr&& headers) override;
   void decodeHeaders(Http::HeaderMapPtr&& headers, bool end_stream) override;
   void decodeData(Buffer::Instance& data, bool end_stream) override;
   void decodeTrailers(Http::HeaderMapPtr&& trailers) override;
@@ -48,6 +51,7 @@ public:
 
 private:
   Event::Dispatcher& dispatcher_;
+  Http::HeaderMapPtr continue_headers_;
   Http::HeaderMapPtr headers_;
   Http::HeaderMapPtr trailers_;
   bool waiting_for_end_stream_{};
@@ -55,6 +59,7 @@ private:
   std::string body_;
   uint64_t body_data_waiting_length_{};
   bool waiting_for_reset_{};
+  bool waiting_for_continue_headers_{};
   bool waiting_for_headers_{};
   bool saw_reset_{};
   Http::StreamResetReason reset_reason_{};
@@ -68,12 +73,14 @@ typedef std::unique_ptr<IntegrationStreamDecoder> IntegrationStreamDecoderPtr;
 class IntegrationTcpClient {
 public:
   IntegrationTcpClient(Event::Dispatcher& dispatcher, MockBufferFactory& factory, uint32_t port,
-                       Network::Address::IpVersion version);
+                       Network::Address::IpVersion version, bool enable_half_close = false);
 
   void close();
   void waitForData(const std::string& data);
   void waitForDisconnect();
-  void write(const std::string& data);
+  void waitForHalfClose();
+  void readDisable(bool disabled);
+  void write(const std::string& data, bool end_stream = false);
   const std::string& data() { return payload_reader_->data(); }
 
 private:
@@ -110,25 +117,24 @@ struct ApiFilesystemConfig {
  */
 class BaseIntegrationTest : Logger::Loggable<Logger::Id::testing> {
 public:
-  BaseIntegrationTest(Network::Address::IpVersion version);
+  BaseIntegrationTest(Network::Address::IpVersion version,
+                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG);
   virtual ~BaseIntegrationTest() {}
 
-  virtual void initialize() {
-    RELEASE_ASSERT(!initialized_);
-    initialized_ = true;
-  }
+  void SetUp();
 
-  /**
-   * Integration tests are composed of a sequence of actions which are run via this routine.
-   */
-  void executeActions(std::list<std::function<void()>> actions) {
-    if (!initialized_) {
-      initialize();
-    }
-    for (const std::function<void()>& action : actions) {
-      action();
-    }
-  }
+  // Initialize the basic proto configuration, create fake upstreams, and start Envoy.
+  virtual void initialize();
+  // Set up the fake upstream connections. This is called by initialize() and
+  // is virtual to allow subclass overrides.
+  virtual void createUpstreams();
+  // Finalize the config and spin up an Envoy instance.
+  virtual void createEnvoy();
+  // sets upstream_protocol_ and alters the upstream protocol in the config_helper_
+  void setUpstreamProtocol(FakeHttpConnection::Type protocol);
+
+  FakeHttpConnection::Type upstreamProtocol() const { return upstream_protocol_; }
+
   IntegrationTcpClientPtr makeTcpConnection(uint32_t port);
 
   // Test-wide port map.
@@ -147,19 +153,50 @@ public:
   Api::ApiPtr api_;
   MockBufferFactory* mock_buffer_factory_; // Will point to the dispatcher's factory.
   Event::DispatcherPtr dispatcher_;
-  void sendRawHttpAndWaitForResponse(const char* http, std::string* response);
+
+  /**
+   * Open a connection to Envoy, send a series of bytes, and return the
+   * response. This function will continue reading response bytes until Envoy
+   * closes the connection (as a part of error handling) or (if configured true)
+   * the complete headers are read.
+   *
+   * @param port the port to connect to.
+   * @param raw_http the data to send.
+   * @param response the response data will be sent here
+   * @param if the connection should be terminated onece '\r\n\r\n' has been read.
+   **/
+  void sendRawHttpAndWaitForResponse(int port, const char* raw_http, std::string* response,
+                                     bool disconnect_after_headers_complete = false);
 
 protected:
+  bool initialized() const { return initialized_; }
+
   // The IpVersion (IPv4, IPv6) to use.
   Network::Address::IpVersion version_;
   // The config for envoy start-up.
-  ConfigHelper config_helper_{version_};
+  ConfigHelper config_helper_;
+  // Steps that should be done prior to the workers starting. E.g., xDS pre-init.
+  std::function<void()> pre_worker_start_test_steps_;
 
   std::vector<std::unique_ptr<FakeUpstream>> fake_upstreams_;
   spdlog::level::level_enum default_log_level_;
   IntegrationTestServerPtr test_server_;
+  // A map of keys to port names. Generally the names are pulled from the v2 listener name
+  // but if a listener is created via ADS, it will be from whatever key is used with registerPort.
   TestEnvironment::PortMap port_map_;
-  bool initialized_{}; // True if initialized() has been called.
+
+  // If true, use AutonomousUpstream for fake upstreams.
+  bool autonomous_upstream_{false};
+
+  bool enable_half_close_{false};
+
+private:
+  // The codec type for the client-to-Envoy connection
+  Http::CodecClient::Type downstream_protocol_{Http::CodecClient::Type::HTTP1};
+  // The type for the Envoy-to-backend connection
+  FakeHttpConnection::Type upstream_protocol_{FakeHttpConnection::Type::HTTP1};
+  // True if initialized() has been called.
+  bool initialized_{};
 };
 
 } // namespace Envoy

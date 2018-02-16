@@ -1,14 +1,16 @@
 #include "server/config_validation/server.h"
 
+#include "envoy/config/bootstrap/v2/bootstrap.pb.h"
+#include "envoy/config/bootstrap/v2/bootstrap.pb.validate.h"
+
 #include "common/common/version.h"
 #include "common/config/bootstrap_json.h"
+#include "common/config/utility.h"
 #include "common/local_info/local_info_impl.h"
 #include "common/protobuf/utility.h"
 #include "common/singleton/manager_impl.h"
 
 #include "server/configuration_impl.h"
-
-#include "api/bootstrap.pb.h"
 
 namespace Envoy {
 namespace Server {
@@ -62,17 +64,11 @@ void ValidationInstance::initialize(Options& options,
   // If we get all the way through that stripped-down initialization flow, to the point where we'd
   // be ready to serve, then the config has passed validation.
   // Handle configuration that needs to take place prior to the main configuration load.
-  envoy::api::v2::Bootstrap bootstrap;
-  try {
-    MessageUtil::loadFromFile(options.configPath(), bootstrap);
-  } catch (const EnvoyException& e) {
-    // TODO(htuch): When v1 is deprecated, make this a warning encouraging config upgrade.
-    ENVOY_LOG(debug, "Unable to initialize config as v2, will retry as v1: {}", e.what());
-  }
-  if (!bootstrap.has_admin()) {
-    Json::ObjectSharedPtr config_json = Json::Factory::loadFromFile(options.configPath());
-    Config::BootstrapJson::translateBootstrap(*config_json, bootstrap);
-  }
+  envoy::config::bootstrap::v2::Bootstrap bootstrap;
+  InstanceUtil::loadBootstrapConfig(bootstrap, options.configPath(), options.v2ConfigOnly());
+
+  Config::Utility::createTagProducer(bootstrap);
+
   bootstrap.mutable_node()->set_build_version(VersionInfo::version());
 
   local_info_.reset(

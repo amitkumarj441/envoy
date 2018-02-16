@@ -5,6 +5,7 @@
 #include "common/config/base_json.h"
 #include "common/config/json_utility.h"
 #include "common/config/metadata.h"
+#include "common/config/utility.h"
 #include "common/config/well_known_names.h"
 #include "common/json/config_schemas.h"
 
@@ -12,13 +13,13 @@ namespace Envoy {
 namespace Config {
 
 void RdsJson::translateWeightedCluster(const Json::Object& json_weighted_clusters,
-                                       envoy::api::v2::WeightedCluster& weighted_cluster) {
+                                       envoy::api::v2::route::WeightedCluster& weighted_cluster) {
   JSON_UTIL_SET_STRING(json_weighted_clusters, weighted_cluster, runtime_key_prefix);
   const auto clusters = json_weighted_clusters.getObjectArray("clusters");
   std::transform(clusters.cbegin(), clusters.cend(),
                  Protobuf::RepeatedPtrFieldBackInserter(weighted_cluster.mutable_clusters()),
                  [](const Json::ObjectSharedPtr& json_cluster_weight) {
-                   envoy::api::v2::WeightedCluster::ClusterWeight cluster_weight;
+                   envoy::api::v2::route::WeightedCluster::ClusterWeight cluster_weight;
                    JSON_UTIL_SET_STRING(*json_cluster_weight, cluster_weight, name);
                    JSON_UTIL_SET_INTEGER(*json_cluster_weight, cluster_weight, weight);
                    return cluster_weight;
@@ -26,16 +27,17 @@ void RdsJson::translateWeightedCluster(const Json::Object& json_weighted_cluster
 }
 
 void RdsJson::translateVirtualCluster(const Json::Object& json_virtual_cluster,
-                                      envoy::api::v2::VirtualCluster& virtual_cluster) {
+                                      envoy::api::v2::route::VirtualCluster& virtual_cluster) {
   JSON_UTIL_SET_STRING(json_virtual_cluster, virtual_cluster, name);
   JSON_UTIL_SET_STRING(json_virtual_cluster, virtual_cluster, pattern);
 
-  envoy::api::v2::RequestMethod method{};
+  envoy::api::v2::core::RequestMethod method{};
   RequestMethod_Parse(json_virtual_cluster.getString("method", "METHOD_UNSPECIFIED"), &method);
   virtual_cluster.set_method(method);
 }
 
-void RdsJson::translateCors(const Json::Object& json_cors, envoy::api::v2::CorsPolicy& cors) {
+void RdsJson::translateCors(const Json::Object& json_cors,
+                            envoy::api::v2::route::CorsPolicy& cors) {
   for (const std::string& origin : json_cors.getStringArray("allow_origin", true)) {
     cors.add_allow_origin(origin);
   }
@@ -48,7 +50,7 @@ void RdsJson::translateCors(const Json::Object& json_cors, envoy::api::v2::CorsP
 }
 
 void RdsJson::translateRateLimit(const Json::Object& json_rate_limit,
-                                 envoy::api::v2::RateLimit& rate_limit) {
+                                 envoy::api::v2::route::RateLimit& rate_limit) {
   json_rate_limit.validateSchema(Json::Schema::HTTP_RATE_LIMITS_CONFIGURATION_SCHEMA);
   JSON_UTIL_SET_INTEGER(json_rate_limit, rate_limit, stage);
   JSON_UTIL_SET_STRING(json_rate_limit, rate_limit, disable_key);
@@ -78,7 +80,7 @@ void RdsJson::translateRateLimit(const Json::Object& json_rate_limit,
       std::transform(headers.cbegin(), headers.cend(),
                      Protobuf::RepeatedPtrFieldBackInserter(header_value_match->mutable_headers()),
                      [](const Json::ObjectSharedPtr& json_header_matcher) {
-                       envoy::api::v2::HeaderMatcher header_matcher;
+                       envoy::api::v2::route::HeaderMatcher header_matcher;
                        translateHeaderMatcher(*json_header_matcher, header_matcher);
                        return header_matcher;
                      });
@@ -87,11 +89,20 @@ void RdsJson::translateRateLimit(const Json::Object& json_rate_limit,
 }
 
 void RdsJson::translateHeaderMatcher(const Json::Object& json_header_matcher,
-                                     envoy::api::v2::HeaderMatcher& header_matcher) {
+                                     envoy::api::v2::route::HeaderMatcher& header_matcher) {
   json_header_matcher.validateSchema(Json::Schema::HEADER_DATA_CONFIGURATION_SCHEMA);
   JSON_UTIL_SET_STRING(json_header_matcher, header_matcher, name);
   JSON_UTIL_SET_STRING(json_header_matcher, header_matcher, value);
   JSON_UTIL_SET_BOOL(json_header_matcher, header_matcher, regex);
+}
+
+void RdsJson::translateQueryParameterMatcher(
+    const Json::Object& json_query_parameter_matcher,
+    envoy::api::v2::route::QueryParameterMatcher& query_parameter_matcher) {
+  json_query_parameter_matcher.validateSchema(Json::Schema::QUERY_PARAMETER_CONFIGURATION_SCHEMA);
+  JSON_UTIL_SET_STRING(json_query_parameter_matcher, query_parameter_matcher, name);
+  JSON_UTIL_SET_STRING(json_query_parameter_matcher, query_parameter_matcher, value);
+  JSON_UTIL_SET_BOOL(json_query_parameter_matcher, query_parameter_matcher, regex);
 }
 
 void RdsJson::translateRouteConfiguration(const Json::Object& json_route_config,
@@ -128,9 +139,12 @@ void RdsJson::translateRouteConfiguration(const Json::Object& json_route_config,
 }
 
 void RdsJson::translateVirtualHost(const Json::Object& json_virtual_host,
-                                   envoy::api::v2::VirtualHost& virtual_host) {
+                                   envoy::api::v2::route::VirtualHost& virtual_host) {
   json_virtual_host.validateSchema(Json::Schema::VIRTUAL_HOST_CONFIGURATION_SCHEMA);
-  JSON_UTIL_SET_STRING(json_virtual_host, virtual_host, name);
+
+  const std::string name = json_virtual_host.getString("name", "");
+  Utility::checkObjNameLength("Invalid virtual host name", name);
+  virtual_host.set_name(name);
 
   for (const std::string& domain : json_virtual_host.getStringArray("domains", true)) {
     virtual_host.add_domains(domain);
@@ -141,8 +155,8 @@ void RdsJson::translateVirtualHost(const Json::Object& json_virtual_host,
     translateRoute(*json_route, *route);
   }
 
-  envoy::api::v2::VirtualHost::TlsRequirementType tls_requirement{};
-  envoy::api::v2::VirtualHost::TlsRequirementType_Parse(
+  envoy::api::v2::route::VirtualHost::TlsRequirementType tls_requirement{};
+  envoy::api::v2::route::VirtualHost::TlsRequirementType_Parse(
       StringUtil::toUpper(json_virtual_host.getString("require_ssl", "")), &tls_requirement);
   virtual_host.set_require_tls(tls_requirement);
 
@@ -170,13 +184,13 @@ void RdsJson::translateVirtualHost(const Json::Object& json_virtual_host,
 }
 
 void RdsJson::translateDecorator(const Json::Object& json_decorator,
-                                 envoy::api::v2::Decorator& decorator) {
+                                 envoy::api::v2::route::Decorator& decorator) {
   if (json_decorator.hasObject("operation")) {
     decorator.set_operation(json_decorator.getString("operation"));
   }
 }
 
-void RdsJson::translateRoute(const Json::Object& json_route, envoy::api::v2::Route& route) {
+void RdsJson::translateRoute(const Json::Object& json_route, envoy::api::v2::route::Route& route) {
   json_route.validateSchema(Json::Schema::ROUTE_ENTRY_CONFIGURATION_SCHEMA);
 
   auto* match = route.mutable_match();
@@ -207,6 +221,12 @@ void RdsJson::translateRoute(const Json::Object& json_route, envoy::api::v2::Rou
     translateHeaderMatcher(*json_header_matcher, *header_matcher);
   }
 
+  for (const auto json_query_parameter_matcher :
+       json_route.getObjectArray("query_parameters", true)) {
+    auto* query_parameter_matcher = match->mutable_query_parameters()->Add();
+    translateQueryParameterMatcher(*json_query_parameter_matcher, *query_parameter_matcher);
+  }
+
   bool has_redirect = false;
   if (json_route.hasObject("host_redirect") || json_route.hasObject("path_redirect")) {
     has_redirect = true;
@@ -217,11 +237,16 @@ void RdsJson::translateRoute(const Json::Object& json_route, envoy::api::v2::Rou
       throw EnvoyException("Redirect route entries must not have WebSockets set");
     }
   }
-  if (json_route.hasObject("cluster") || json_route.hasObject("cluster_header") ||
-      json_route.hasObject("weighted_clusters")) {
-    if (has_redirect) {
-      throw EnvoyException("routes must be either redirects or cluster targets");
-    }
+  const bool has_cluster = json_route.hasObject("cluster") ||
+                           json_route.hasObject("cluster_header") ||
+                           json_route.hasObject("weighted_clusters");
+
+  if (has_cluster && has_redirect) {
+    throw EnvoyException("routes must be either redirects or cluster targets");
+  } else if (!has_cluster && !has_redirect) {
+    throw EnvoyException(
+        "routes must have redirect or one of cluster/cluster_header/weighted_clusters");
+  } else if (has_cluster) {
     auto* action = route.mutable_route();
 
     if (json_route.hasObject("cluster")) {
@@ -272,7 +297,7 @@ void RdsJson::translateRoute(const Json::Object& json_route, envoy::api::v2::Rou
       JSON_UTIL_SET_STRING(*json_shadow, *request_mirror_policy, runtime_key);
     }
 
-    envoy::api::v2::RoutingPriority priority{};
+    envoy::api::v2::core::RoutingPriority priority{};
     RoutingPriority_Parse(StringUtil::toUpper(json_route.getString("priority", "default")),
                           &priority);
     action->set_priority(priority);

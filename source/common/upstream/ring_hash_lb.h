@@ -1,12 +1,11 @@
 #pragma once
 
-#include <cstdint>
 #include <vector>
 
 #include "envoy/runtime/runtime.h"
-#include "envoy/upstream/load_balancer.h"
 
 #include "common/common/logger.h"
+#include "common/upstream/thread_aware_lb_impl.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -20,13 +19,13 @@ namespace Upstream {
  * 2) Per-zone rings and optional zone aware routing (not all applications will want this).
  * 3) Max request fallback to support hot shards (not all applications will want this).
  */
-class RingHashLoadBalancer : public LoadBalancer, Logger::Loggable<Logger::Id::upstream> {
+class RingHashLoadBalancer : public ThreadAwareLoadBalancerBase,
+                             Logger::Loggable<Logger::Id::upstream> {
 public:
-  RingHashLoadBalancer(HostSet& host_set, ClusterStats& stats, Runtime::Loader& runtime,
-                       Runtime::RandomGenerator& random);
-
-  // Upstream::LoadBalancer
-  HostConstSharedPtr chooseHost(const LoadBalancerContext* context) override;
+  RingHashLoadBalancer(PrioritySet& priority_set, ClusterStats& stats, Runtime::Loader& runtime,
+                       Runtime::RandomGenerator& random,
+                       const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
+                       const envoy::api::v2::Cluster::CommonLbConfig& common_config);
 
 private:
   struct RingEntry {
@@ -34,22 +33,23 @@ private:
     HostConstSharedPtr host_;
   };
 
-  struct Ring {
-    HostConstSharedPtr chooseHost(const LoadBalancerContext* context,
-                                  Runtime::RandomGenerator& random);
-    void create(Runtime::Loader& runtime, const std::vector<HostSharedPtr>& hosts);
+  struct Ring : public HashingLoadBalancer {
+    Ring(const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
+         const HostVector& hosts);
+
+    // ThreadAwareLoadBalancerBase::HashingLoadBalancer
+    HostConstSharedPtr chooseHost(uint64_t hash) const override;
 
     std::vector<RingEntry> ring_;
   };
+  typedef std::shared_ptr<const Ring> RingConstSharedPtr;
 
-  void refresh();
+  // ThreadAwareLoadBalancerBase
+  HashingLoadBalancerSharedPtr createLoadBalancer(const HostVector& hosts) override {
+    return std::make_shared<Ring>(config_, hosts);
+  }
 
-  HostSet& host_set_;
-  ClusterStats& stats_;
-  Runtime::Loader& runtime_;
-  Runtime::RandomGenerator& random_;
-  Ring all_hosts_ring_;
-  Ring healthy_hosts_ring_;
+  const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config_;
 };
 
 } // namespace Upstream

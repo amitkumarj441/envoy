@@ -48,6 +48,7 @@ envoy_cc_library(
         "//include/envoy/filesystem:filesystem_interface",
         "//include/envoy/mongo:codec_interface",
         "//include/envoy/network:connection_interface",
+        "//include/envoy/network:drain_decision_interface",
         "//include/envoy/network:filter_interface",
         "//include/envoy/runtime:runtime_interface",
         "//include/envoy/stats:stats_interface",
@@ -55,9 +56,11 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
-        "//source/common/common:singleton",
         "//source/common/common:utility_lib",
         "//source/common/network:filter_lib",
+        "//source/common/protobuf:utility_lib",
+        "//source/common/singleton:const_singleton",
+        "@envoy_api//envoy/config/filter/network/mongo_proxy/v2:mongo_proxy_cc",
     ],
 )
 

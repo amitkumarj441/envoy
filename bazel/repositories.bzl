@@ -1,7 +1,65 @@
+load(
+    "@bazel_tools//tools/build_defs/repo:git.bzl",
+    "git_repository",
+    "new_git_repository",
+)
+load(":genrule_repository.bzl", "genrule_repository")
+load(":patched_http_archive.bzl", "patched_http_archive")
+load(":repository_locations.bzl", "REPOSITORY_LOCATIONS")
 load(":target_recipes.bzl", "TARGET_RECIPES")
-load(":repository_locations.bzl", "REPO_LOCATIONS")
 
-def _repository_impl(ctxt):
+def _repository_impl(name, **kwargs):
+    # `existing_rule_keys` contains the names of repositories that have already
+    # been defined in the Bazel workspace. By skipping repos with existing keys,
+    # users can override dependency versions by using standard Bazel repository
+    # rules in their WORKSPACE files.
+    existing_rule_keys = native.existing_rules().keys()
+    if name in existing_rule_keys:
+        # This repository has already been defined, probably because the user
+        # wants to override the version. Do nothing.
+        return
+
+    location = REPOSITORY_LOCATIONS[name]
+
+    # Git tags are mutable. We want to depend on commit IDs instead. Give the
+    # user a useful error if they accidentally specify a tag.
+    if "tag" in location:
+        fail(
+            "Refusing to depend on Git tag %r for external dependency %r: use 'commit' instead."
+            % (location["tag"], name))
+
+    if "commit" in location:
+        # Git repository at given commit ID. Add a BUILD file if requested.
+        if "build_file" in kwargs:
+            new_git_repository(
+                name = name,
+                remote = location["remote"],
+                commit = location["commit"],
+                **kwargs)
+        else:
+            git_repository(
+                name = name,
+                remote = location["remote"],
+                commit = location["commit"],
+                **kwargs)
+    else:  # HTTP
+        # HTTP tarball at a given URL. Add a BUILD file if requested.
+        if "build_file" in kwargs:
+            native.new_http_archive(
+                name = name,
+                urls = location["urls"],
+                sha256 = location["sha256"],
+                strip_prefix = location["strip_prefix"],
+                **kwargs)
+        else:
+            native.http_archive(
+                name = name,
+                urls = location["urls"],
+                sha256 = location["sha256"],
+                strip_prefix = location["strip_prefix"],
+                **kwargs)
+
+def _build_recipe_repository_impl(ctxt):
     # Setup the build directory with links to the relevant files.
     ctxt.symlink(Label("//bazel:repositories.sh"), "repositories.sh")
     ctxt.symlink(Label("//ci/build_container:build_and_install_deps.sh"),
@@ -31,140 +89,60 @@ def _repository_impl(ctxt):
         # This error message doesn't appear to the user :( https://github.com/bazelbuild/bazel/issues/3683
         fail("External dep build failed")
 
-def _protobuf_repository_impl(ctxt):
-    deps_path = ctxt.attr.envoy_deps_path
-    if not deps_path.endswith("/"):
-        deps_path += "/"
-    ctxt.symlink(Label(deps_path + "thirdparty/protobuf:protobuf.bzl"), "protobuf.bzl")
-    ctxt.symlink(Label(deps_path + "thirdparty/protobuf:BUILD"), "BUILD")
-    ctxt.symlink(ctxt.path(Label(deps_path + "thirdparty/protobuf:BUILD")).dirname.get_child("src"),
-                 "src")
-
-def py_jinja2_dep():
-    BUILD = """
-py_library(
-    name = "jinja2",
-    srcs = glob(["jinja2/**/*.py"]),
-    visibility = ["//visibility:public"],
-    deps = ["@markupsafe_git//:markupsafe"],
-)
-"""
-    native.new_git_repository(
-        name = "jinja2_git",
-        remote = REPO_LOCATIONS["jinja2"],
-        tag = "2.9.6",
-        build_file_content = BUILD,
-    )
-
-def py_markupsafe_dep():
-    BUILD = """
-py_library(
-    name = "markupsafe",
-    srcs = glob(["markupsafe/**/*.py"]),
-    visibility = ["//visibility:public"],
-)
-"""
-    native.new_git_repository(
-        name = "markupsafe_git",
-        remote = REPO_LOCATIONS["markupsafe"],
-        tag = "1.0",
-        build_file_content = BUILD,
-    )
-
 # Python dependencies. If these become non-trivial, we might be better off using a virtualenv to
 # wrap them, but for now we can treat them as first-class Bazel.
-def python_deps(skip_targets):
-    if 'markupsafe' not in skip_targets:
-        py_markupsafe_dep()
-        native.bind(
-            name = "markupsafe",
-            actual = "@markupsafe_git//:markupsafe",
-        )
-    if 'jinja2' not in skip_targets:
-        py_jinja2_dep()
-        native.bind(
-            name = "jinja2",
-            actual = "@jinja2_git//:jinja2",
-        )
-
-def cc_grpc_httpjson_transcoding_dep():
-    native.git_repository(
-        name = "grpc_httpjson_transcoding",
-        remote = REPO_LOCATIONS["grpc_transcoding"],
-        commit = "e4f58aa07b9002befa493a0a82e10f2e98b51fc6",
+def _python_deps():
+    _repository_impl(
+        name = "com_github_pallets_markupsafe",
+        build_file = "@envoy//bazel/external:markupsafe.BUILD",
+    )
+    native.bind(
+        name = "markupsafe",
+        actual = "@com_github_pallets_markupsafe//:markupsafe",
+    )
+    _repository_impl(
+        name = "com_github_pallets_jinja",
+        build_file = "@envoy//bazel/external:jinja.BUILD",
+    )
+    native.bind(
+        name = "jinja2",
+        actual = "@com_github_pallets_jinja//:jinja2",
     )
 
 # Bazel native C++ dependencies. For the depedencies that doesn't provide autoconf/automake builds.
-def cc_deps(skip_targets):
-    if 'grpc-httpjson-transcoding' not in skip_targets:
-        cc_grpc_httpjson_transcoding_dep()
-        native.bind(
-            name = "path_matcher",
-            actual = "@grpc_httpjson_transcoding//src:path_matcher",
-        )
-        native.bind(
-            name = "grpc_transcoding",
-            actual = "@grpc_httpjson_transcoding//src:transcoding",
-        )
-
-def envoy_api_deps(skip_targets):
-  if 'envoy_api' not in skip_targets:
-    native.git_repository(
-        name = "envoy_api",
-        remote = REPO_LOCATIONS["envoy_api"],
-        commit = "9be6aff6da46e024af56cce20cb5d5d3184f19c5",
+def _cc_deps():
+    _repository_impl("grpc_httpjson_transcoding")
+    native.bind(
+        name = "path_matcher",
+        actual = "@grpc_httpjson_transcoding//src:path_matcher",
     )
-    api_bind_targets = [
-        "address",
-        "base",
-        "bootstrap",
-        "discovery",
-        "cds",
-        "discovery",
-        "eds",
-        "health_check",
-        "lds",
-        "protocol",
-        "rds",
-        "tls_context",
-    ]
-    for t in api_bind_targets:
-        native.bind(
-            name = "envoy_" + t,
-            actual = "@envoy_api//api:" + t + "_cc",
-        )
-    filter_bind_targets = [
-        "http_connection_manager",
-    ]
-    for t in filter_bind_targets:
-        native.bind(
-            name = "envoy_filter_" + t,
-            actual = "@envoy_api//api/filter:" + t + "_cc",
-        )
+    native.bind(
+        name = "grpc_transcoding",
+        actual = "@grpc_httpjson_transcoding//src:transcoding",
+    )
+
+def _go_deps(skip_targets):
+    # Keep the skip_targets check around until Istio Proxy has stopped using
+    # it to exclude the Go rules.
+    if "io_bazel_rules_go" not in skip_targets:
+        _repository_impl("io_bazel_rules_go")
+
+def _envoy_api_deps():
+    _repository_impl("envoy_api")
+
     native.bind(
         name = "http_api_protos",
         actual = "@googleapis//:http_api_protos",
     )
-    native.bind(
-        name = "http_api_protos_genproto",
-        actual = "@googleapis//:http_api_protos_genproto",
-    )
 
-def envoy_dependencies(path = "@envoy_deps//", skip_protobuf_bzl = False, skip_targets = []):
-    native.bind(
-        name = "cc_wkt_protos",
-        actual = "@protobuf_bzl//:cc_wkt_protos",
-    )
-    native.bind(
-        name = "cc_wkt_protos_genproto",
-        actual = "@protobuf_bzl//:cc_wkt_protos_genproto",
-    )
-
+def envoy_dependencies(path = "@envoy_deps//", skip_targets = []):
     envoy_repository = repository_rule(
-        implementation = _repository_impl,
+        implementation = _build_recipe_repository_impl,
         environ = [
             "CC",
             "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
             "LD_LIBRARY_PATH"
         ],
         # Don't pretend we're in the sandbox, we do some evil stuff with envoy_dep_cache.
@@ -186,23 +164,6 @@ def envoy_dependencies(path = "@envoy_deps//", skip_protobuf_bzl = False, skip_t
         name = "envoy_deps",
         recipes = recipes.to_list(),
     )
-
-    protobuf_repository = repository_rule(
-        implementation = _protobuf_repository_impl,
-        attrs = {
-            "envoy_deps_path": attr.string(),
-        },
-    )
-
-    # If the WORKSPACE hasn't already supplied @protobuf_bzl and told us to skip it, we need to map in the
-    # full repo into @protobuf_bzl so that we can depend on this in envoy_build_system.bzl and for things
-    # like @protobuf_bzl//:cc_wkt_protos in envoy-api. We do this by some evil symlink stuff.
-    if not skip_protobuf_bzl:
-        protobuf_repository(
-            name = "protobuf_bzl",
-            envoy_deps_path = path,
-        )
-
     for t in TARGET_RECIPES:
         if t not in skip_targets:
             native.bind(
@@ -210,6 +171,192 @@ def envoy_dependencies(path = "@envoy_deps//", skip_protobuf_bzl = False, skip_t
                 actual = path + ":" + t,
             )
 
-    python_deps(skip_targets)
-    cc_deps(skip_targets)
-    envoy_api_deps(skip_targets)
+    # The long repo names (`com_github_fmtlib_fmt` instead of `fmtlib`) are
+    # semi-standard in the Bazel community, intended to avoid both duplicate
+    # dependencies and name conflicts.
+    _com_google_absl()
+    _com_github_bombela_backward()
+    _com_github_cyan4973_xxhash()
+    _com_github_eile_tclap()
+    _com_github_fmtlib_fmt()
+    _com_github_gabime_spdlog()
+    _com_github_gcovr_gcovr()
+    _io_opentracing_cpp()
+    _com_lightstep_tracer_cpp()
+    _com_github_grpc_grpc()
+    _com_github_nodejs_http_parser()
+    _com_github_tencent_rapidjson()
+    _com_google_googletest()
+    _com_google_protobuf()
+
+    # Used for bundling gcovr into a relocatable .par file.
+    _repository_impl("subpar")
+
+    _python_deps()
+    _cc_deps()
+    _go_deps(skip_targets)
+    _envoy_api_deps()
+
+def _com_github_bombela_backward():
+    _repository_impl(
+        name = "com_github_bombela_backward",
+        build_file = "@envoy//bazel/external:backward.BUILD",
+    )
+    native.bind(
+        name = "backward",
+        actual = "@com_github_bombela_backward//:backward",
+    )
+
+def _com_github_cyan4973_xxhash():
+    _repository_impl(
+        name = "com_github_cyan4973_xxhash",
+        build_file = "@envoy//bazel/external:xxhash.BUILD",
+    )
+    native.bind(
+        name = "xxhash",
+        actual = "@com_github_cyan4973_xxhash//:xxhash",
+    )
+
+def _com_github_eile_tclap():
+    _repository_impl(
+        name = "com_github_eile_tclap",
+        build_file = "@envoy//bazel/external:tclap.BUILD",
+    )
+    native.bind(
+        name = "tclap",
+        actual = "@com_github_eile_tclap//:tclap",
+    )
+
+def _com_github_fmtlib_fmt():
+    _repository_impl(
+        name = "com_github_fmtlib_fmt",
+        build_file = "@envoy//bazel/external:fmtlib.BUILD",
+    )
+    native.bind(
+        name = "fmtlib",
+        actual = "@com_github_fmtlib_fmt//:fmtlib",
+    )
+
+def _com_github_gabime_spdlog():
+    _repository_impl(
+        name = "com_github_gabime_spdlog",
+        build_file = "@envoy//bazel/external:spdlog.BUILD",
+    )
+    native.bind(
+        name = "spdlog",
+        actual = "@com_github_gabime_spdlog//:spdlog",
+    )
+
+def _com_github_gcovr_gcovr():
+    _repository_impl(
+        name = "com_github_gcovr_gcovr",
+        build_file = "@envoy//bazel/external:gcovr.BUILD",
+    )
+    native.bind(
+        name = "gcovr",
+        actual = "@com_github_gcovr_gcovr//:gcovr",
+    )
+
+def _io_opentracing_cpp():
+    _repository_impl("io_opentracing_cpp")
+    native.bind(
+        name = "opentracing",
+        actual = "@io_opentracing_cpp//:opentracing",
+    )
+
+def _com_lightstep_tracer_cpp():
+    _repository_impl("com_lightstep_tracer_cpp")
+    _repository_impl(
+        name = "lightstep_vendored_googleapis",
+        build_file = "@com_lightstep_tracer_cpp//:lightstep-tracer-common/third_party/googleapis/BUILD",
+    )
+    native.bind(
+        name = "lightstep",
+        actual = "@com_lightstep_tracer_cpp//:lightstep_tracer",
+    )
+
+def _com_github_tencent_rapidjson():
+    _repository_impl(
+        name = "com_github_tencent_rapidjson",
+        build_file = "@envoy//bazel/external:rapidjson.BUILD",
+    )
+    native.bind(
+        name = "rapidjson",
+        actual = "@com_github_tencent_rapidjson//:rapidjson",
+    )
+
+def _com_github_nodejs_http_parser():
+    _repository_impl(
+        name = "com_github_nodejs_http_parser",
+        build_file = "@envoy//bazel/external:http-parser.BUILD",
+    )
+    native.bind(
+        name = "http_parser",
+        actual = "@com_github_nodejs_http_parser//:http_parser",
+    )
+
+def _com_google_googletest():
+    _repository_impl("com_google_googletest")
+    native.bind(
+        name = "googletest",
+        actual = "@com_google_googletest//:gtest",
+    )
+
+def _com_google_absl():
+    _repository_impl("com_google_absl")
+    native.bind(
+        name = "abseil_base",
+        actual = "@com_google_absl//absl/base:base",
+    )
+    native.bind(
+        name = "abseil_strings",
+        actual = "@com_google_absl//absl/strings:strings",
+    )
+    native.bind(
+        name = "abseil_int128",
+        actual = "@com_google_absl//absl/numeric:int128",
+    )
+
+def _com_google_protobuf():
+    _repository_impl("com_google_protobuf")
+
+    # Needed for cc_proto_library, Bazel doesn't support aliases today for repos,
+    # see https://groups.google.com/forum/#!topic/bazel-discuss/859ybHQZnuI and
+    # https://github.com/bazelbuild/bazel/issues/3219.
+    location = REPOSITORY_LOCATIONS["com_google_protobuf"]
+    native.http_archive(name = "com_google_protobuf_cc", **location)
+    native.bind(
+        name = "protobuf",
+        actual = "@com_google_protobuf//:protobuf",
+    )
+    native.bind(
+        name = "protoc",
+        actual = "@com_google_protobuf_cc//:protoc",
+    )
+
+def _com_github_grpc_grpc():
+    _repository_impl("com_github_grpc_grpc")
+
+    # Rebind some stuff to match what the gRPC Bazel is expecting.
+    native.bind(
+      name = "protobuf_headers",
+      actual = "@com_google_protobuf//:protobuf_headers",
+    )
+    native.bind(
+      name = "libssl",
+      actual = "//external:ssl",
+    )
+    native.bind(
+      name = "cares",
+      actual = "//external:ares",
+    )
+
+    native.bind(
+      name = "grpc",
+      actual = "@com_github_grpc_grpc//:grpc++"
+    )
+
+    native.bind(
+      name = "grpc_health_proto",
+      actual = "@envoy//bazel:grpc_health_proto",
+    )

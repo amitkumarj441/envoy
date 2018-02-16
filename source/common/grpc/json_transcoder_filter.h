@@ -1,6 +1,7 @@
 #pragma once
 
 #include "envoy/buffer/buffer.h"
+#include "envoy/config/filter/http/transcoder/v2/transcoder.pb.h"
 #include "envoy/http/filter.h"
 #include "envoy/http/header_map.h"
 #include "envoy/json/json_object.h"
@@ -43,7 +44,8 @@ public:
    * constructor that loads protobuf descriptors from the file specified in the JSON config.
    * and construct a path matcher for HTTP path bindings.
    */
-  JsonTranscoderConfig(const Json::Object& config);
+  JsonTranscoderConfig(
+      const envoy::config::filter::http::transcoder::v2::GrpcJsonTranscoder& proto_config);
 
   /**
    * Create an instance of Transcoder interface based on incoming request
@@ -90,6 +92,9 @@ public:
   void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override;
 
   // Http::StreamEncoderFilter
+  Http::FilterHeadersStatus encode100ContinueHeaders(Http::HeaderMap&) override {
+    return Http::FilterHeadersStatus::Continue;
+  }
   Http::FilterHeadersStatus encodeHeaders(Http::HeaderMap& headers, bool end_stream) override;
   Http::FilterDataStatus encodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus encodeTrailers(Http::HeaderMap& trailers) override;

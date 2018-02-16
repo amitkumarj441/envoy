@@ -33,6 +33,18 @@ ConnPoolImpl::~ConnPoolImpl() {
   dispatcher_.clearDeferredDeleteList();
 }
 
+void ConnPoolImpl::drainConnections() {
+  while (!ready_clients_.empty()) {
+    ready_clients_.front()->codec_client_->close();
+  }
+
+  // We drain busy clients by manually setting remaining requests to 1. Thus, when the next
+  // response completes the client will be destroyed.
+  for (const auto& client : busy_clients_) {
+    client->remaining_requests_ = 1;
+  }
+}
+
 void ConnPoolImpl::addDrainedCallback(DrainedCb cb) {
   drained_callbacks_.push_back(cb);
   checkForDrained();
@@ -271,9 +283,10 @@ ConnPoolImpl::ActiveClient::ActiveClient(ConnPoolImpl& parent)
       connect_timer_(parent_.dispatcher_.createTimer([this]() -> void { onConnectTimeout(); })),
       remaining_requests_(parent_.host_->cluster().maxRequestsPerConnection()) {
 
-  parent_.conn_connect_ms_ =
-      parent_.host_->cluster().stats().upstream_cx_connect_ms_.allocateSpan();
-  Upstream::Host::CreateConnectionData data = parent_.host_->createConnection(parent_.dispatcher_);
+  parent_.conn_connect_ms_.reset(
+      new Stats::Timespan(parent_.host_->cluster().stats().upstream_cx_connect_ms_));
+  Upstream::Host::CreateConnectionData data =
+      parent_.host_->createConnection(parent_.dispatcher_, parent_.socket_options_);
   real_host_description_ = data.host_description_;
   codec_client_ = parent_.createCodecClient(data);
   codec_client_->addConnectionCallbacks(*this);
@@ -283,7 +296,7 @@ ConnPoolImpl::ActiveClient::ActiveClient(ConnPoolImpl& parent)
   parent_.host_->cluster().stats().upstream_cx_http1_total_.inc();
   parent_.host_->stats().cx_total_.inc();
   parent_.host_->stats().cx_active_.inc();
-  conn_length_ = parent_.host_->cluster().stats().upstream_cx_length_ms_.allocateSpan();
+  conn_length_.reset(new Stats::Timespan(parent_.host_->cluster().stats().upstream_cx_length_ms_));
   connect_timer_->enableTimer(parent_.host_->cluster().connectTimeout());
   parent_.host_->cluster().resourceManager(parent_.priority_).connections().inc();
 

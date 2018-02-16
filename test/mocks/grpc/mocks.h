@@ -4,7 +4,7 @@
 #include <string>
 
 #include "envoy/grpc/async_client.h"
-#include "envoy/grpc/rpc_channel.h"
+#include "envoy/grpc/async_client_manager.h"
 
 #include "gmock/gmock.h"
 
@@ -19,25 +19,28 @@ public:
   MOCK_METHOD0(cancel, void());
 };
 
-template <class RequestType> class MockAsyncStream : public AsyncStream<RequestType> {
+class MockAsyncStream : public AsyncStream {
 public:
-  MOCK_METHOD2_T(sendMessage, void(const RequestType& request, bool end_stream));
+  MOCK_METHOD2_T(sendMessage, void(const Protobuf::Message& request, bool end_stream));
   MOCK_METHOD0_T(closeStream, void());
   MOCK_METHOD0_T(resetStream, void());
 };
 
 template <class ResponseType>
-class MockAsyncRequestCallbacks : public AsyncRequestCallbacks<ResponseType> {
+class MockAsyncRequestCallbacks : public TypedAsyncRequestCallbacks<ResponseType> {
 public:
-  void onSuccess(std::unique_ptr<ResponseType>&& response) { onSuccess_(*response); }
+  void onSuccess(std::unique_ptr<ResponseType>&& response, Tracing::Span& span) {
+    onSuccess_(*response, span);
+  }
 
   MOCK_METHOD1_T(onCreateInitialMetadata, void(Http::HeaderMap& metadata));
-  MOCK_METHOD1_T(onSuccess_, void(const ResponseType& response));
-  MOCK_METHOD2_T(onFailure, void(Status::GrpcStatus status, const std::string& message));
+  MOCK_METHOD2_T(onSuccess_, void(const ResponseType& response, Tracing::Span& span));
+  MOCK_METHOD3_T(onFailure,
+                 void(Status::GrpcStatus status, const std::string& message, Tracing::Span& span));
 };
 
 template <class ResponseType>
-class MockAsyncStreamCallbacks : public AsyncStreamCallbacks<ResponseType> {
+class MockAsyncStreamCallbacks : public TypedAsyncStreamCallbacks<ResponseType> {
 public:
   void onReceiveInitialMetadata(Http::HeaderMapPtr&& metadata) {
     onReceiveInitialMetadata_(*metadata);
@@ -56,37 +59,32 @@ public:
   MOCK_METHOD2_T(onRemoteClose, void(Status::GrpcStatus status, const std::string& message));
 };
 
-template <class RequestType, class ResponseType>
-class MockAsyncClient : public AsyncClient<RequestType, ResponseType> {
+class MockAsyncClient : public AsyncClient {
 public:
-  MOCK_METHOD4_T(send, AsyncRequest*(const Protobuf::MethodDescriptor& service_method,
-                                     const RequestType& request,
-                                     AsyncRequestCallbacks<ResponseType>& callbacks,
+  MOCK_METHOD5_T(send, AsyncRequest*(const Protobuf::MethodDescriptor& service_method,
+                                     const Protobuf::Message& request,
+                                     AsyncRequestCallbacks& callbacks, Tracing::Span& parent_span,
                                      const Optional<std::chrono::milliseconds>& timeout));
-  MOCK_METHOD2_T(start, AsyncStream<RequestType>*(const Protobuf::MethodDescriptor& service_method,
-                                                  AsyncStreamCallbacks<ResponseType>& callbacks));
+  MOCK_METHOD2_T(start, AsyncStream*(const Protobuf::MethodDescriptor& service_method,
+                                     AsyncStreamCallbacks& callbacks));
 };
 
-class MockRpcChannelCallbacks : public RpcChannelCallbacks {
+class MockAsyncClientFactory : public AsyncClientFactory {
 public:
-  MockRpcChannelCallbacks();
-  ~MockRpcChannelCallbacks();
+  MockAsyncClientFactory();
+  ~MockAsyncClientFactory();
 
-  MOCK_METHOD1(onPreRequestCustomizeHeaders, void(Http::HeaderMap& headers));
-  MOCK_METHOD0(onSuccess, void());
-  MOCK_METHOD2(onFailure, void(const Optional<uint64_t>& grpc_status, const std::string& message));
+  MOCK_METHOD0(create, AsyncClientPtr());
 };
 
-class MockRpcChannel : public RpcChannel {
+class MockAsyncClientManager : public AsyncClientManager {
 public:
-  MockRpcChannel();
-  ~MockRpcChannel();
+  MockAsyncClientManager();
+  ~MockAsyncClientManager();
 
-  MOCK_METHOD0(cancel, void());
-  MOCK_METHOD5(CallMethod,
-               void(const Protobuf::MethodDescriptor* method, Protobuf::RpcController* controller,
-                    const Protobuf::Message* request, Protobuf::Message* response,
-                    Protobuf::Closure* done));
+  MOCK_METHOD2(factoryForGrpcService,
+               AsyncClientFactoryPtr(const envoy::api::v2::core::GrpcService& grpc_service,
+                                     Stats::Scope& scope));
 };
 
 } // namespace Grpc

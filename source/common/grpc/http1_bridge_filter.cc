@@ -22,12 +22,15 @@ void Http1BridgeFilter::chargeStat(const Http::HeaderMap& headers) {
 
 Http::FilterHeadersStatus Http1BridgeFilter::decodeHeaders(Http::HeaderMap& headers, bool) {
   const Http::HeaderEntry* content_type = headers.ContentType();
-  bool grpc_request = content_type && content_type->value() == Common::GRPC_CONTENT_TYPE.c_str();
+  const bool grpc_request =
+      content_type && content_type->value() == Http::Headers::get().ContentTypeValues.Grpc.c_str();
   if (grpc_request) {
     setupStatTracking(headers);
   }
 
-  if (decoder_callbacks_->requestInfo().protocol() != Http::Protocol::Http2 && grpc_request) {
+  const Optional<Http::Protocol>& protocol = decoder_callbacks_->requestInfo().protocol();
+  ASSERT(protocol.valid());
+  if (protocol.value() != Http::Protocol::Http2 && grpc_request) {
     do_bridging_ = true;
   }
 

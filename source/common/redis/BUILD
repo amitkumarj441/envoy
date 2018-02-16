@@ -41,15 +41,14 @@ envoy_cc_library(
     deps = [
         ":codec_lib",
         "//include/envoy/redis:conn_pool_interface",
+        "//include/envoy/router:router_interface",
         "//include/envoy/thread_local:thread_local_interface",
         "//include/envoy/upstream:cluster_manager_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
-        "//source/common/common:enum_to_int",
-        "//source/common/http:codes_lib",
-        "//source/common/json:config_schemas_lib",
-        "//source/common/json:json_validator_lib",
         "//source/common/network:filter_lib",
+        "//source/common/protobuf:utility_lib",
+        "@envoy_api//envoy/config/filter/network/redis_proxy/v2:redis_proxy_cc",
     ],
 )
 
@@ -58,6 +57,7 @@ envoy_cc_library(
     srcs = ["proxy_filter.cc"],
     hdrs = ["proxy_filter.h"],
     deps = [
+        "//include/envoy/network:drain_decision_interface",
         "//include/envoy/network:filter_interface",
         "//include/envoy/redis:codec_interface",
         "//include/envoy/redis:command_splitter_interface",
@@ -65,9 +65,7 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/config:utility_lib",
-        "//source/common/json:config_schemas_lib",
-        "//source/common/json:json_loader_lib",
-        "//source/common/json:json_validator_lib",
+        "@envoy_api//envoy/config/filter/network/redis_proxy/v2:redis_proxy_cc",
     ],
 )
 

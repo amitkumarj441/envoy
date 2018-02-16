@@ -25,7 +25,7 @@ public:
 
   // Implements StreamDecoderFilter.
   Http::FilterHeadersStatus decodeHeaders(Http::HeaderMap&, bool) override;
-  Http::FilterDataStatus decodeData(Buffer::Instance&, bool) override;
+  Http::FilterDataStatus decodeData(Buffer::Instance&, bool end_stream) override;
   Http::FilterTrailersStatus decodeTrailers(Http::HeaderMap&) override {
     return Http::FilterTrailersStatus::Continue;
   }
@@ -34,6 +34,9 @@ public:
   }
 
   // Implements StreamEncoderFilter.
+  Http::FilterHeadersStatus encode100ContinueHeaders(Http::HeaderMap&) override {
+    return Http::FilterHeadersStatus::Continue;
+  }
   Http::FilterHeadersStatus encodeHeaders(Http::HeaderMap&, bool) override;
   Http::FilterDataStatus encodeData(Buffer::Instance&, bool) override;
   Http::FilterTrailersStatus encodeTrailers(Http::HeaderMap& trailers) override;

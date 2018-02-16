@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/api/v2/discovery.pb.h"
 #include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 
@@ -8,8 +9,6 @@
 #include "common/grpc/common.h"
 #include "common/protobuf/protobuf.h"
 #include "common/protobuf/utility.h"
-
-#include "api/discovery.pb.h"
 
 namespace Envoy {
 namespace Config {
@@ -55,10 +54,9 @@ public:
     stats_.update_success_.inc();
     stats_.update_attempt_.inc();
     version_info_ = version_info;
-    ENVOY_LOG(debug, "gRPC config for {} accepted with {} resources", type_url_, resources.size());
-    for (const auto resource : typed_resources) {
-      ENVOY_LOG(debug, "- {}", resource.DebugString());
-    }
+    stats_.version_.set(HashUtil::xxHash64(version_info_));
+    ENVOY_LOG(debug, "gRPC config for {} accepted with {} resources: {}", type_url_,
+              resources.size(), RepeatedPtrUtil::debugString(typed_resources));
   }
 
   void onConfigUpdateFailed(const EnvoyException* e) override {

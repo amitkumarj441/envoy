@@ -21,6 +21,12 @@ static_assert(offsetof(RawSlice, len_) == offsetof(evbuffer_iovec, iov_len),
 
 void OwnedImpl::add(const void* data, uint64_t size) { evbuffer_add(buffer_.get(), data, size); }
 
+void OwnedImpl::addBufferFragment(BufferFragment& fragment) {
+  evbuffer_add_reference(
+      buffer_.get(), fragment.data(), fragment.size(),
+      [](const void*, size_t, void* arg) { static_cast<BufferFragment*>(arg)->done(); }, &fragment);
+}
+
 void OwnedImpl::add(const std::string& data) {
   evbuffer_add(buffer_.get(), data.c_str(), data.size());
 }
@@ -39,6 +45,19 @@ void OwnedImpl::commit(RawSlice* iovecs, uint64_t num_iovecs) {
       evbuffer_commit_space(buffer_.get(), reinterpret_cast<evbuffer_iovec*>(iovecs), num_iovecs);
   ASSERT(rc == 0);
   UNREFERENCED_PARAMETER(rc);
+}
+
+void OwnedImpl::copyOut(size_t start, uint64_t size, void* data) const {
+  ASSERT(start + size <= length());
+
+  evbuffer_ptr start_ptr;
+  int rc = evbuffer_ptr_set(buffer_.get(), &start_ptr, start, EVBUFFER_PTR_SET);
+  ASSERT(rc != -1);
+  UNREFERENCED_PARAMETER(rc);
+
+  ev_ssize_t copied = evbuffer_copyout_from(buffer_.get(), &start_ptr, data, size);
+  ASSERT(static_cast<uint64_t>(copied) == size);
+  UNREFERENCED_PARAMETER(copied);
 }
 
 void OwnedImpl::drain(uint64_t size) {

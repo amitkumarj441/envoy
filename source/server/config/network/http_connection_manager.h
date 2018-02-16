@@ -26,16 +26,23 @@ class HttpConnectionManagerFilterConfigFactory : Logger::Loggable<Logger::Id::co
                                                  public NamedNetworkFilterConfigFactory {
 public:
   // NamedNetworkFilterConfigFactory
-  NetworkFilterFactoryCb createFilterFactory(const Json::Object& config,
+  NetworkFilterFactoryCb createFilterFactory(const Json::Object& json_config,
                                              FactoryContext& context) override;
-  NetworkFilterFactoryCb createFilterFactoryFromProto(const Protobuf::Message& config,
+  NetworkFilterFactoryCb createFilterFactoryFromProto(const Protobuf::Message& proto_config,
                                                       FactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
-    return std::unique_ptr<envoy::api::v2::filter::HttpConnectionManager>(
-        new envoy::api::v2::filter::HttpConnectionManager());
+    return std::unique_ptr<
+        envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager>(
+        new envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager());
   }
   std::string name() override { return Config::NetworkFilterNames::get().HTTP_CONNECTION_MANAGER; }
+
+private:
+  NetworkFilterFactoryCb createFilter(
+      const envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager&
+          proto_config,
+      FactoryContext& context);
 };
 
 /**
@@ -59,17 +66,17 @@ class HttpConnectionManagerConfig : Logger::Loggable<Logger::Id::config>,
                                     public Http::FilterChainFactory,
                                     public Http::ConnectionManagerConfig {
 public:
-  HttpConnectionManagerConfig(const envoy::api::v2::filter::HttpConnectionManager& config,
-                              FactoryContext& context, Http::DateProvider& date_provider,
-                              Router::RouteConfigProviderManager& route_config_provider_manager);
+  HttpConnectionManagerConfig(
+      const envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager&
+          config,
+      FactoryContext& context, Http::DateProvider& date_provider,
+      Router::RouteConfigProviderManager& route_config_provider_manager);
 
   // Http::FilterChainFactory
   void createFilterChain(Http::FilterChainFactoryCallbacks& callbacks) override;
 
   // Http::ConnectionManagerConfig
-  const std::list<Http::AccessLog::InstanceSharedPtr>& accessLogs() override {
-    return access_logs_;
-  }
+  const std::list<AccessLog::InstanceSharedPtr>& accessLogs() override { return access_logs_; }
   Http::ServerConnectionPtr createCodec(Network::Connection& connection,
                                         const Buffer::Instance& data,
                                         Http::ServerConnectionCallbacks& callbacks) override;
@@ -83,6 +90,7 @@ public:
   Http::ConnectionManagerStats& stats() override { return stats_; }
   Http::ConnectionManagerTracingStats& tracingStats() override { return tracing_stats_; }
   bool useRemoteAddress() override { return use_remote_address_; }
+  uint32_t xffNumTrustedHops() const override { return xff_num_trusted_hops_; }
   Http::ForwardClientCertType forwardClientCert() override { return forward_client_cert_; }
   const std::vector<Http::ClientCertDetailsType>& setCurrentClientCertDetails() const override {
     return set_current_client_cert_details_;
@@ -92,6 +100,8 @@ public:
   }
   const Network::Address::Instance& localAddress() override;
   const Optional<std::string>& userAgent() override { return user_agent_; }
+  Http::ConnectionManagerListenerStats& listenerStats() override { return listener_stats_; }
+  bool proxy100Continue() const override { return proxy_100_continue_; }
 
   static const std::string DEFAULT_SERVER_STRING;
 
@@ -100,11 +110,12 @@ private:
 
   FactoryContext& context_;
   std::list<HttpFilterFactoryCb> filter_factories_;
-  std::list<Http::AccessLog::InstanceSharedPtr> access_logs_;
+  std::list<AccessLog::InstanceSharedPtr> access_logs_;
   const std::string stats_prefix_;
   Http::ConnectionManagerStats stats_;
   Http::ConnectionManagerTracingStats tracing_stats_;
   const bool use_remote_address_{};
+  const uint32_t xff_num_trusted_hops_;
   Http::ForwardClientCertType forward_client_cert_;
   std::vector<Http::ClientCertDetailsType> set_current_client_cert_details_;
   Router::RouteConfigProviderManager& route_config_provider_manager_;
@@ -119,6 +130,8 @@ private:
   std::chrono::milliseconds drain_timeout_;
   bool generate_request_id_;
   Http::DateProvider& date_provider_;
+  Http::ConnectionManagerListenerStats listener_stats_;
+  const bool proxy_100_continue_;
 };
 
 } // namespace Configuration

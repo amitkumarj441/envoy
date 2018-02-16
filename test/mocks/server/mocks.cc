@@ -10,6 +10,7 @@
 using testing::Invoke;
 using testing::Return;
 using testing::ReturnNew;
+using testing::ReturnPointee;
 using testing::ReturnRef;
 using testing::SaveArg;
 using testing::_;
@@ -20,10 +21,15 @@ namespace Server {
 MockOptions::MockOptions(const std::string& config_path)
     : config_path_(config_path), admin_address_path_("") {
   ON_CALL(*this, configPath()).WillByDefault(ReturnRef(config_path_));
+  ON_CALL(*this, v2ConfigOnly()).WillByDefault(Invoke([this] { return v2_config_only_; }));
   ON_CALL(*this, adminAddressPath()).WillByDefault(ReturnRef(admin_address_path_));
   ON_CALL(*this, serviceClusterName()).WillByDefault(ReturnRef(service_cluster_name_));
   ON_CALL(*this, serviceNodeName()).WillByDefault(ReturnRef(service_node_name_));
   ON_CALL(*this, serviceZone()).WillByDefault(ReturnRef(service_zone_name_));
+  ON_CALL(*this, logPath()).WillByDefault(ReturnRef(log_path_));
+  ON_CALL(*this, maxStats()).WillByDefault(Return(1000));
+  ON_CALL(*this, maxObjNameLength()).WillByDefault(Return(150));
+  ON_CALL(*this, hotRestartDisabled()).WillByDefault(ReturnPointee(&hot_restart_disabled_));
 }
 MockOptions::~MockOptions() {}
 
@@ -43,7 +49,11 @@ MockGuardDog::MockGuardDog() : watch_dog_(new NiceMock<MockWatchDog>()) {
 }
 MockGuardDog::~MockGuardDog() {}
 
-MockHotRestart::MockHotRestart() {}
+MockHotRestart::MockHotRestart() {
+  ON_CALL(*this, logLock()).WillByDefault(ReturnRef(log_lock_));
+  ON_CALL(*this, accessLogLock()).WillByDefault(ReturnRef(access_log_lock_));
+  ON_CALL(*this, statsAllocator()).WillByDefault(ReturnRef(stats_allocator_));
+}
 MockHotRestart::~MockHotRestart() {}
 
 MockListenerComponentFactory::MockListenerComponentFactory()
@@ -55,29 +65,23 @@ MockListenerComponentFactory::~MockListenerComponentFactory() {}
 MockListenerManager::MockListenerManager() {}
 MockListenerManager::~MockListenerManager() {}
 
-MockListener::MockListener() {
-  ON_CALL(*this, filterChainFactory()).WillByDefault(ReturnRef(filter_chain_factory_));
-  ON_CALL(*this, socket()).WillByDefault(ReturnRef(socket_));
-  ON_CALL(*this, listenerScope()).WillByDefault(ReturnRef(scope_));
-  ON_CALL(*this, name()).WillByDefault(ReturnRef(name_));
-}
-MockListener::~MockListener() {}
-
 MockWorkerFactory::MockWorkerFactory() {}
 MockWorkerFactory::~MockWorkerFactory() {}
 
 MockWorker::MockWorker() {
   ON_CALL(*this, addListener(_, _))
-      .WillByDefault(Invoke([this](Listener&, AddListenerCompletion completion) -> void {
-        EXPECT_EQ(nullptr, add_listener_completion_);
-        add_listener_completion_ = completion;
-      }));
+      .WillByDefault(
+          Invoke([this](Network::ListenerConfig&, AddListenerCompletion completion) -> void {
+            EXPECT_EQ(nullptr, add_listener_completion_);
+            add_listener_completion_ = completion;
+          }));
 
   ON_CALL(*this, removeListener(_, _))
-      .WillByDefault(Invoke([this](Listener&, std::function<void()> completion) -> void {
-        EXPECT_EQ(nullptr, remove_listener_completion_);
-        remove_listener_completion_ = completion;
-      }));
+      .WillByDefault(
+          Invoke([this](Network::ListenerConfig&, std::function<void()> completion) -> void {
+            EXPECT_EQ(nullptr, remove_listener_completion_);
+            remove_listener_completion_ = completion;
+          }));
 }
 MockWorker::~MockWorker() {}
 
@@ -130,9 +134,16 @@ MockFactoryContext::MockFactoryContext() : singleton_manager_(new Singleton::Man
   ON_CALL(*this, singletonManager()).WillByDefault(ReturnRef(*singleton_manager_));
   ON_CALL(*this, threadLocal()).WillByDefault(ReturnRef(thread_local_));
   ON_CALL(*this, admin()).WillByDefault(ReturnRef(admin_));
+  ON_CALL(*this, listenerScope()).WillByDefault(ReturnRef(listener_scope_));
 }
 
 MockFactoryContext::~MockFactoryContext() {}
+
+MockTransportSocketFactoryContext::MockTransportSocketFactoryContext() {}
+MockTransportSocketFactoryContext::~MockTransportSocketFactoryContext() {}
+
+MockListenerFactoryContext::MockListenerFactoryContext() {}
+MockListenerFactoryContext::~MockListenerFactoryContext() {}
 
 } // namespace Configuration
 } // namespace Server

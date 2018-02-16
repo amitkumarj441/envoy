@@ -2,6 +2,7 @@
 
 #include <functional>
 
+#include "envoy/api/v2/cds.pb.h"
 #include "envoy/config/subscription.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/local_info/local_info.h"
@@ -9,8 +10,6 @@
 #include "common/common/assert.h"
 #include "common/common/logger.h"
 #include "common/http/rest_api_fetcher.h"
-
-#include "api/cds.pb.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -23,10 +22,11 @@ class CdsSubscription : public Http::RestApiFetcher,
                         public Config::Subscription<envoy::api::v2::Cluster>,
                         Logger::Loggable<Logger::Id::upstream> {
 public:
-  CdsSubscription(Config::SubscriptionStats stats, const envoy::api::v2::ConfigSource& cds_config,
-                  const Optional<envoy::api::v2::ConfigSource>& eds_config, ClusterManager& cm,
-                  Event::Dispatcher& dispatcher, Runtime::RandomGenerator& random,
-                  const LocalInfo::LocalInfo& local_info);
+  CdsSubscription(Config::SubscriptionStats stats,
+                  const envoy::api::v2::core::ConfigSource& cds_config,
+                  const Optional<envoy::api::v2::core::ConfigSource>& eds_config,
+                  ClusterManager& cm, Event::Dispatcher& dispatcher,
+                  Runtime::RandomGenerator& random, const LocalInfo::LocalInfo& local_info);
 
 private:
   // Config::Subscription
@@ -56,9 +56,9 @@ private:
 
   std::string version_info_;
   const LocalInfo::LocalInfo& local_info_;
-  Config::SubscriptionCallbacks<envoy::api::v2::Cluster>* callbacks_;
+  Config::SubscriptionCallbacks<envoy::api::v2::Cluster>* callbacks_ = nullptr;
   Config::SubscriptionStats stats_;
-  const Optional<envoy::api::v2::ConfigSource>& eds_config_;
+  const Optional<envoy::api::v2::core::ConfigSource>& eds_config_;
 };
 
 } // namespace Upstream

@@ -5,17 +5,24 @@
 #include <memory>
 #include <string>
 
+#include "envoy/config/filter/http/router/v2/router.pb.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/codes.h"
 #include "envoy/http/filter.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/router/shadow_writer.h"
 #include "envoy/runtime/runtime.h"
+#include "envoy/server/filter_config.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/upstream/cluster_manager.h"
 
+#include "common/access_log/access_log_impl.h"
 #include "common/buffer/watermark_buffer.h"
+#include "common/common/hash.h"
+#include "common/common/hex.h"
 #include "common/common/logger.h"
+#include "common/http/utility.h"
+#include "common/request_info/request_info_impl.h"
 
 namespace Envoy {
 namespace Router {
@@ -28,6 +35,7 @@ namespace Router {
   COUNTER(no_route)                                                                                \
   COUNTER(no_cluster)                                                                              \
   COUNTER(rq_redirect)                                                                             \
+  COUNTER(rq_direct_response)                                                                      \
   COUNTER(rq_total)
 // clang-format on
 
@@ -81,10 +89,23 @@ public:
   FilterConfig(const std::string& stat_prefix, const LocalInfo::LocalInfo& local_info,
                Stats::Scope& scope, Upstream::ClusterManager& cm, Runtime::Loader& runtime,
                Runtime::RandomGenerator& random, ShadowWriterPtr&& shadow_writer,
-               bool emit_dynamic_stats)
+               bool emit_dynamic_stats, bool start_child_span)
       : scope_(scope), local_info_(local_info), cm_(cm), runtime_(runtime),
         random_(random), stats_{ALL_ROUTER_STATS(POOL_COUNTER_PREFIX(scope, stat_prefix))},
-        emit_dynamic_stats_(emit_dynamic_stats), shadow_writer_(std::move(shadow_writer)) {}
+        emit_dynamic_stats_(emit_dynamic_stats), start_child_span_(start_child_span),
+        shadow_writer_(std::move(shadow_writer)) {}
+
+  FilterConfig(const std::string& stat_prefix, Server::Configuration::FactoryContext& context,
+               ShadowWriterPtr&& shadow_writer,
+               const envoy::config::filter::http::router::v2::Router& config)
+      : FilterConfig(stat_prefix, context.localInfo(), context.scope(), context.clusterManager(),
+                     context.runtime(), context.random(), std::move(shadow_writer),
+                     PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, dynamic_stats, true),
+                     config.start_child_span()) {
+    for (const auto& upstream_log : config.upstream_log()) {
+      upstream_logs_.push_back(AccessLog::AccessLogFactory::fromProto(upstream_log, context));
+    }
+  }
 
   ShadowWriter& shadowWriter() { return *shadow_writer_; }
 
@@ -95,6 +116,8 @@ public:
   Runtime::RandomGenerator& random_;
   FilterStats stats_;
   const bool emit_dynamic_stats_;
+  const bool start_child_span_;
+  std::list<AccessLog::InstanceSharedPtr> upstream_logs_;
 
 private:
   ShadowWriterPtr shadow_writer_;
@@ -125,17 +148,49 @@ public:
   void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override;
 
   // Upstream::LoadBalancerContext
-  Optional<uint64_t> hashKey() const override {
+  Optional<uint64_t> computeHashKey() override {
     if (route_entry_ && downstream_headers_) {
       auto hash_policy = route_entry_->hashPolicy();
       if (hash_policy) {
-        return hash_policy->generateHash(*downstream_headers_);
+        return hash_policy->generateHash(
+            callbacks_->requestInfo().downstreamRemoteAddress()->asString(), *downstream_headers_,
+            [this](const std::string& key, std::chrono::seconds max_age) {
+              return addDownstreamSetCookie(key, max_age);
+            });
       }
     }
     return {};
   }
+  const Router::MetadataMatchCriteria* metadataMatchCriteria() const override {
+    if (route_entry_) {
+      return route_entry_->metadataMatchCriteria();
+    }
+    return nullptr;
+  }
   const Network::Connection* downstreamConnection() const override {
     return callbacks_->connection();
+  }
+
+  /**
+   * Set a computed cookie to be sent with the downstream headers.
+   * @param key supplies the size of the cookie
+   * @param max_age the lifetime of the cookie
+   * @return std::string the value of the new cookie
+   */
+  std::string addDownstreamSetCookie(const std::string& key, std::chrono::seconds max_age) {
+    // The cookie value should be the same per connection so that if multiple
+    // streams race on the same path, they all receive the same cookie.
+    // Since the downstream port is part of the hashed value, multiple HTTP1
+    // connections can receive different cookies if they race on requests.
+    std::string value;
+    const Network::Connection* conn = downstreamConnection();
+    // Need to check for null conn if this is ever used by Http::AsyncClient in the future.
+    value = conn->remoteAddress()->asString() + conn->localAddress()->asString();
+
+    const std::string cookie_value = Hex::uint64ToHex(HashUtil::xxHash64(value));
+    downstream_set_cookies_.emplace_back(
+        Http::Utility::makeSetCookieValue(key, cookie_value, max_age));
+    return cookie_value;
   }
 
 protected:
@@ -145,10 +200,7 @@ private:
   struct UpstreamRequest : public Http::StreamDecoder,
                            public Http::StreamCallbacks,
                            public Http::ConnectionPool::Callbacks {
-    UpstreamRequest(Filter& parent, Http::ConnectionPool::Instance& pool)
-        : parent_(parent), conn_pool_(pool), calling_encode_headers_(false),
-          upstream_canary_(false), encode_complete_(false), encode_trailers_(false) {}
-
+    UpstreamRequest(Filter& parent, Http::ConnectionPool::Instance& pool);
     ~UpstreamRequest();
 
     void encodeHeaders(bool end_stream);
@@ -159,11 +211,13 @@ private:
     void onPerTryTimeout();
 
     void onUpstreamHostSelected(Upstream::HostDescriptionConstSharedPtr host) {
+      request_info_.onUpstreamHostSelected(host);
       upstream_host_ = host;
       parent_.callbacks_->requestInfo().onUpstreamHostSelected(host);
     }
 
     // Http::StreamDecoder
+    void decode100ContinueHeaders(Http::HeaderMapPtr&& headers) override;
     void decodeHeaders(Http::HeaderMapPtr&& headers, bool end_stream) override;
     void decodeData(Buffer::Instance& data, bool end_stream) override;
     void decodeTrailers(Http::HeaderMapPtr&& trailers) override;
@@ -205,6 +259,7 @@ private:
 
     Filter& parent_;
     Http::ConnectionPool::Instance& conn_pool_;
+    bool grpc_rq_success_deferred_;
     Event::TimerPtr per_try_timeout_;
     Http::ConnectionPool::Cancellable* conn_pool_stream_handle_{};
     Http::StreamEncoder* request_encoder_{};
@@ -212,6 +267,9 @@ private:
     Buffer::WatermarkBufferPtr buffered_request_body_;
     Upstream::HostDescriptionConstSharedPtr upstream_host_;
     DownstreamWatermarkManager downstream_watermark_manager_{*this};
+    Tracing::SpanPtr span_;
+    RequestInfo::RequestInfoImpl request_info_;
+    Http::HeaderMap* upstream_headers_{};
 
     bool calling_encode_headers_ : 1;
     bool upstream_canary_ : 1;
@@ -223,13 +281,13 @@ private:
 
   enum class UpstreamResetType { Reset, GlobalTimeout, PerTryTimeout };
 
-  Http::AccessLog::ResponseFlag
-  streamResetReasonToResponseFlag(Http::StreamResetReason reset_reason);
+  RequestInfo::ResponseFlag streamResetReasonToResponseFlag(Http::StreamResetReason reset_reason);
 
-  static const std::string& upstreamZone(Upstream::HostDescriptionConstSharedPtr upstream_host);
-  void chargeUpstreamCode(const Http::HeaderMap& response_headers,
-                          Upstream::HostDescriptionConstSharedPtr upstream_host);
-  void chargeUpstreamCode(Http::Code code, Upstream::HostDescriptionConstSharedPtr upstream_host);
+  static const std::string upstreamZone(Upstream::HostDescriptionConstSharedPtr upstream_host);
+  void chargeUpstreamCode(uint64_t response_status_code, const Http::HeaderMap& response_headers,
+                          Upstream::HostDescriptionConstSharedPtr upstream_host, bool dropped);
+  void chargeUpstreamCode(Http::Code code, Upstream::HostDescriptionConstSharedPtr upstream_host,
+                          bool dropped);
   void cleanup();
   virtual RetryStatePtr createRetryState(const RetryPolicy& policy,
                                          Http::HeaderMap& request_headers,
@@ -241,7 +299,8 @@ private:
   void maybeDoShadowing();
   void onRequestComplete();
   void onResponseTimeout();
-  void onUpstreamHeaders(Http::HeaderMapPtr&& headers, bool end_stream);
+  void onUpstream100ContinueHeaders(Http::HeaderMapPtr&& headers);
+  void onUpstreamHeaders(uint64_t response_code, Http::HeaderMapPtr&& headers, bool end_stream);
   void onUpstreamData(Buffer::Instance& data, bool end_stream);
   void onUpstreamTrailers(Http::HeaderMapPtr&& trailers);
   void onUpstreamComplete();
@@ -250,6 +309,19 @@ private:
   void sendNoHealthyUpstreamResponse();
   bool setupRetry(bool end_stream);
   void doRetry();
+  // Called immediately after a non-5xx header is received from upstream, performs stats accounting
+  // and handle difference between gRPC and non-gRPC requests.
+  void handleNon5xxResponseHeaders(const Http::HeaderMap& headers, bool end_stream);
+
+  /**
+   * Send a locally generated (non-proxied) HTTP response.
+   * @param code supplies the HTTP status code.
+   * @param body supplies the response body (empty string if no body is needed).
+   * @param modify_headers supplies an optional callback function that can modify the
+   *                       response headers.
+   */
+  void sendLocalReply(Http::Code code, const std::string& body,
+                      std::function<void(Http::HeaderMap& headers)> modify_headers = nullptr);
 
   FilterConfig& config_;
   Http::StreamDecoderFilterCallbacks* callbacks_{};
@@ -262,11 +334,15 @@ private:
   FilterUtility::TimeoutData timeout_;
   Http::Code timeout_response_code_ = Http::Code::GatewayTimeout;
   UpstreamRequestPtr upstream_request_;
+  bool grpc_request_{};
   Http::HeaderMap* downstream_headers_{};
   Http::HeaderMap* downstream_trailers_{};
   MonotonicTime downstream_request_complete_time_;
   uint32_t buffer_limit_{0};
   bool stream_destroyed_{};
+
+  // list of cookies to add to upstream headers
+  std::vector<std::string> downstream_set_cookies_;
 
   bool downstream_response_started_ : 1;
   bool downstream_end_stream_ : 1;

@@ -36,25 +36,20 @@ public:
   ~LogicalDnsCluster();
 
   // Upstream::Cluster
-  void initialize() override {}
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
-  void setInitializedCb(std::function<void()> callback) override {
-    if (initialized_) {
-      callback();
-    } else {
-      initialize_callback_ = callback;
-    }
-  }
 
 private:
   struct LogicalHost : public HostImpl {
     LogicalHost(ClusterInfoConstSharedPtr cluster, const std::string& hostname,
                 Network::Address::InstanceConstSharedPtr address, LogicalDnsCluster& parent)
-        : HostImpl(cluster, hostname, address, envoy::api::v2::Metadata::default_instance(), 1, ""),
+        : HostImpl(cluster, hostname, address, envoy::api::v2::core::Metadata::default_instance(),
+                   1, envoy::api::v2::core::Locality().default_instance()),
           parent_(parent) {}
 
     // Upstream::Host
-    CreateConnectionData createConnection(Event::Dispatcher& dispatcher) const override;
+    CreateConnectionData
+    createConnection(Event::Dispatcher& dispatcher,
+                     const Network::ConnectionSocket::OptionsSharedPtr& options) const override;
 
     LogicalDnsCluster& parent_;
   };
@@ -66,8 +61,8 @@ private:
 
     // Upstream:HostDescription
     bool canary() const override { return false; }
-    const envoy::api::v2::Metadata& metadata() const override {
-      return envoy::api::v2::Metadata::default_instance();
+    const envoy::api::v2::core::Metadata& metadata() const override {
+      return envoy::api::v2::core::Metadata::default_instance();
     }
     const ClusterInfo& cluster() const override { return logical_host_->cluster(); }
     HealthCheckHostMonitor& healthChecker() const override {
@@ -79,7 +74,9 @@ private:
     const HostStats& stats() const override { return logical_host_->stats(); }
     const std::string& hostname() const override { return logical_host_->hostname(); }
     Network::Address::InstanceConstSharedPtr address() const override { return address_; }
-    const std::string& zone() const override { return EMPTY_STRING; }
+    const envoy::api::v2::core::Locality& locality() const override {
+      return envoy::api::v2::core::Locality().default_instance();
+    }
 
     Network::Address::InstanceConstSharedPtr address_;
     HostConstSharedPtr logical_host_;
@@ -91,13 +88,13 @@ private:
 
   void startResolve();
 
+  // ClusterImplBase
+  void startPreInit() override;
+
   Network::DnsResolverSharedPtr dns_resolver_;
   const std::chrono::milliseconds dns_refresh_rate_ms_;
   Network::DnsLookupFamily dns_lookup_family_;
   ThreadLocal::SlotPtr tls_;
-  std::function<void()> initialize_callback_;
-  // Set once the first resolve completes.
-  bool initialized_;
   Event::TimerPtr resolve_timer_;
   std::string dns_url_;
   std::string hostname_;

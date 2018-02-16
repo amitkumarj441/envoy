@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "envoy/access_log/access_log.h"
 #include "envoy/event/deferred_deletable.h"
-#include "envoy/http/access_log.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/filter.h"
 #include "envoy/http/websocket.h"
@@ -25,10 +25,10 @@
 
 #include "common/buffer/watermark_buffer.h"
 #include "common/common/linked_object.h"
-#include "common/http/access_log/request_info_impl.h"
 #include "common/http/date_provider.h"
 #include "common/http/user_agent.h"
 #include "common/http/websocket/ws_handler_impl.h"
+#include "common/request_info/request_info_impl.h"
 #include "common/tracing/http_tracer_impl.h"
 
 namespace Envoy {
@@ -38,57 +38,57 @@ namespace Http {
  * All stats for the connection manager. @see stats_macros.h
  */
 // clang-format off
-#define ALL_HTTP_CONN_MAN_STATS(COUNTER, GAUGE, TIMER)                                             \
-  COUNTER(downstream_cx_total)                                                                     \
-  COUNTER(downstream_cx_ssl_total)                                                                 \
-  COUNTER(downstream_cx_http1_total)                                                               \
-  COUNTER(downstream_cx_websocket_total)                                                           \
-  COUNTER(downstream_cx_http2_total)                                                               \
-  COUNTER(downstream_cx_destroy)                                                                   \
-  COUNTER(downstream_cx_destroy_remote)                                                            \
-  COUNTER(downstream_cx_destroy_local)                                                             \
-  COUNTER(downstream_cx_destroy_active_rq)                                                         \
-  COUNTER(downstream_cx_destroy_local_active_rq)                                                   \
-  COUNTER(downstream_cx_destroy_remote_active_rq)                                                  \
-  GAUGE  (downstream_cx_active)                                                                    \
-  GAUGE  (downstream_cx_ssl_active)                                                                \
-  GAUGE  (downstream_cx_http1_active)                                                              \
-  GAUGE  (downstream_cx_websocket_active)                                                          \
-  GAUGE  (downstream_cx_http2_active)                                                              \
-  COUNTER(downstream_cx_protocol_error)                                                            \
-  TIMER  (downstream_cx_length_ms)                                                                 \
-  COUNTER(downstream_cx_rx_bytes_total)                                                            \
-  GAUGE  (downstream_cx_rx_bytes_buffered)                                                         \
-  COUNTER(downstream_cx_tx_bytes_total)                                                            \
-  GAUGE  (downstream_cx_tx_bytes_buffered)                                                         \
-  COUNTER(downstream_cx_drain_close)                                                               \
-  COUNTER(downstream_cx_idle_timeout)                                                              \
-  COUNTER(downstream_flow_control_paused_reading_total)                                            \
-  COUNTER(downstream_flow_control_resumed_reading_total)                                           \
-  COUNTER(downstream_rq_total)                                                                     \
-  COUNTER(downstream_rq_http1_total)                                                               \
-  COUNTER(downstream_rq_http2_total)                                                               \
-  GAUGE  (downstream_rq_active)                                                                    \
-  COUNTER(downstream_rq_response_before_rq_complete)                                               \
-  COUNTER(downstream_rq_rx_reset)                                                                  \
-  COUNTER(downstream_rq_tx_reset)                                                                  \
-  COUNTER(downstream_rq_non_relative_path)                                                         \
-  COUNTER(downstream_rq_ws_on_non_ws_route)                                                        \
-  COUNTER(downstream_rq_non_ws_on_ws_route)                                                        \
-  COUNTER(downstream_rq_too_large)                                                              \
-  COUNTER(downstream_rq_2xx)                                                                       \
-  COUNTER(downstream_rq_3xx)                                                                       \
-  COUNTER(downstream_rq_4xx)                                                                       \
-  COUNTER(downstream_rq_5xx)                                                                       \
-  TIMER  (downstream_rq_time)                                                                      \
-  COUNTER(rs_too_large)
+#define ALL_HTTP_CONN_MAN_STATS(COUNTER, GAUGE, HISTOGRAM)                                         \
+  COUNTER  (downstream_cx_total)                                                                   \
+  COUNTER  (downstream_cx_ssl_total)                                                               \
+  COUNTER  (downstream_cx_http1_total)                                                             \
+  COUNTER  (downstream_cx_websocket_total)                                                         \
+  COUNTER  (downstream_cx_http2_total)                                                             \
+  COUNTER  (downstream_cx_destroy)                                                                 \
+  COUNTER  (downstream_cx_destroy_remote)                                                          \
+  COUNTER  (downstream_cx_destroy_local)                                                           \
+  COUNTER  (downstream_cx_destroy_active_rq)                                                       \
+  COUNTER  (downstream_cx_destroy_local_active_rq)                                                 \
+  COUNTER  (downstream_cx_destroy_remote_active_rq)                                                \
+  GAUGE    (downstream_cx_active)                                                                  \
+  GAUGE    (downstream_cx_ssl_active)                                                              \
+  GAUGE    (downstream_cx_http1_active)                                                            \
+  GAUGE    (downstream_cx_websocket_active)                                                        \
+  GAUGE    (downstream_cx_http2_active)                                                            \
+  COUNTER  (downstream_cx_protocol_error)                                                          \
+  HISTOGRAM(downstream_cx_length_ms)                                                               \
+  COUNTER  (downstream_cx_rx_bytes_total)                                                          \
+  GAUGE    (downstream_cx_rx_bytes_buffered)                                                       \
+  COUNTER  (downstream_cx_tx_bytes_total)                                                          \
+  GAUGE    (downstream_cx_tx_bytes_buffered)                                                       \
+  COUNTER  (downstream_cx_drain_close)                                                             \
+  COUNTER  (downstream_cx_idle_timeout)                                                            \
+  COUNTER  (downstream_flow_control_paused_reading_total)                                          \
+  COUNTER  (downstream_flow_control_resumed_reading_total)                                         \
+  COUNTER  (downstream_rq_total)                                                                   \
+  COUNTER  (downstream_rq_http1_total)                                                             \
+  COUNTER  (downstream_rq_http2_total)                                                             \
+  GAUGE    (downstream_rq_active)                                                                  \
+  COUNTER  (downstream_rq_response_before_rq_complete)                                             \
+  COUNTER  (downstream_rq_rx_reset)                                                                \
+  COUNTER  (downstream_rq_tx_reset)                                                                \
+  COUNTER  (downstream_rq_non_relative_path)                                                       \
+  COUNTER  (downstream_rq_ws_on_non_ws_route)                                                      \
+  COUNTER  (downstream_rq_too_large)                                                               \
+  COUNTER  (downstream_rq_1xx)                                                                     \
+  COUNTER  (downstream_rq_2xx)                                                                     \
+  COUNTER  (downstream_rq_3xx)                                                                     \
+  COUNTER  (downstream_rq_4xx)                                                                     \
+  COUNTER  (downstream_rq_5xx)                                                                     \
+  HISTOGRAM(downstream_rq_time)                                                                    \
+  COUNTER  (rs_too_large)
 // clang-format on
 
 /**
  * Wrapper struct for connection manager stats. @see stats_macros.h
  */
 struct ConnectionManagerNamedStats {
-  ALL_HTTP_CONN_MAN_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_TIMER_STRUCT)
+  ALL_HTTP_CONN_MAN_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 };
 
 struct ConnectionManagerStats {
@@ -129,6 +129,25 @@ struct TracingConnectionManagerConfig {
 typedef std::unique_ptr<TracingConnectionManagerConfig> TracingConnectionManagerConfigPtr;
 
 /**
+ * Connection manager per listener stats. @see stats_macros.h
+ */
+// clang-format off
+#define CONN_MAN_LISTENER_STATS(COUNTER)                                                           \
+  COUNTER(downstream_rq_1xx)                                                                       \
+  COUNTER(downstream_rq_2xx)                                                                       \
+  COUNTER(downstream_rq_3xx)                                                                       \
+  COUNTER(downstream_rq_4xx)                                                                       \
+  COUNTER(downstream_rq_5xx)
+// clang-format on
+
+/**
+ * Wrapper struct for connection manager listener stats. @see stats_macros.h
+ */
+struct ConnectionManagerListenerStats {
+  CONN_MAN_LISTENER_STATS(GENERATE_COUNTER_STRUCT)
+};
+
+/**
  * Configuration for how to forward client certs.
  */
 enum class ForwardClientCertType {
@@ -143,7 +162,7 @@ enum class ForwardClientCertType {
  * Configuration for the fields of the client cert, used for populating the current client cert
  * information to the next hop.
  */
-enum class ClientCertDetailsType { Subject, SAN };
+enum class ClientCertDetailsType { Cert, Subject, SAN };
 
 /**
  * Abstract configuration for the connection manager.
@@ -226,6 +245,12 @@ public:
   virtual bool useRemoteAddress() PURE;
 
   /**
+   * @return uint32_t the number of trusted proxy hops in front of this Envoy instance, for
+   *         the purposes of XFF processing.
+   */
+  virtual uint32_t xffNumTrustedHops() const PURE;
+
+  /**
    * @return ForwardClientCertType the configuration of how to forward the client cert information.
    */
   virtual ForwardClientCertType forwardClientCert() PURE;
@@ -253,6 +278,16 @@ public:
    * @return tracing config.
    */
   virtual const TracingConnectionManagerConfig* tracingConfig() PURE;
+
+  /**
+   * @return ConnectionManagerListenerStats& the stats to write to.
+   */
+  virtual ConnectionManagerListenerStats& listenerStats() PURE;
+
+  /**
+   * @return bool supplies if the HttpConnectionManager should proxy the Expect: 100-Continue
+   */
+  virtual bool proxy100Continue() const PURE;
 };
 
 /**
@@ -276,9 +311,12 @@ public:
                                                             Stats::Scope& scope);
   static void chargeTracingStats(const Tracing::Reason& tracing_reason,
                                  ConnectionManagerTracingStats& tracing_stats);
+  static ConnectionManagerListenerStats generateListenerStats(const std::string& prefix,
+                                                              Stats::Scope& scope);
+  static const HeaderMapImpl& continueHeader();
 
   // Network::ReadFilter
-  Network::FilterStatus onData(Buffer::Instance& data) override;
+  Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override { return Network::FilterStatus::Continue; }
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override;
 
@@ -306,8 +344,10 @@ private:
    */
   struct ActiveStreamFilterBase : public virtual StreamFilterCallbacks {
     ActiveStreamFilterBase(ActiveStream& parent, bool dual_filter)
-        : parent_(parent), headers_continued_(false), stopped_(false), dual_filter_(dual_filter) {}
+        : parent_(parent), headers_continued_(false), continue_headers_continued_(false),
+          stopped_(false), dual_filter_(dual_filter) {}
 
+    bool commonHandleAfter100ContinueHeadersCallback(FilterHeadersStatus status);
     bool commonHandleAfterHeadersCallback(FilterHeadersStatus status);
     void commonHandleBufferData(Buffer::Instance& provided_data);
     bool commonHandleAfterDataCallback(FilterDataStatus status, Buffer::Instance& provided_data,
@@ -315,9 +355,11 @@ private:
     bool commonHandleAfterTrailersCallback(FilterTrailersStatus status);
 
     void commonContinue();
+    virtual bool canContinue() PURE;
     virtual Buffer::WatermarkBufferPtr createBuffer() PURE;
     virtual Buffer::WatermarkBufferPtr& bufferedData() PURE;
     virtual bool complete() PURE;
+    virtual void do100ContinueHeaders() PURE;
     virtual void doHeaders(bool end_stream) PURE;
     virtual void doData(bool end_stream) PURE;
     virtual void doTrailers() PURE;
@@ -330,12 +372,13 @@ private:
     Router::RouteConstSharedPtr route() override;
     void clearRouteCache() override;
     uint64_t streamId() override;
-    AccessLog::RequestInfo& requestInfo() override;
+    RequestInfo::RequestInfo& requestInfo() override;
     Tracing::Span& activeSpan() override;
-    const std::string& downstreamAddress() override;
+    Tracing::Config& tracingConfig() override;
 
     ActiveStream& parent_;
     bool headers_continued_ : 1;
+    bool continue_headers_continued_ : 1;
     bool stopped_ : 1;
     const bool dual_filter_ : 1;
   };
@@ -351,9 +394,18 @@ private:
         : ActiveStreamFilterBase(parent, dual_filter), handle_(filter) {}
 
     // ActiveStreamFilterBase
+    bool canContinue() override {
+      // It is possible for the connection manager to respond directly to a request even while
+      // a filter is trying to continue. If a response has already happened, we should not
+      // continue to further filters. A concrete example of this is a filter buffering data, the
+      // last data frame comes in and the filter continues, but the final buffering takes the stream
+      // over the high watermark such that a 413 is returned.
+      return !parent_.state_.local_complete_;
+    }
     Buffer::WatermarkBufferPtr createBuffer() override;
     Buffer::WatermarkBufferPtr& bufferedData() override { return parent_.buffered_request_data_; }
     bool complete() override { return parent_.state_.remote_complete_; }
+    void do100ContinueHeaders() override { NOT_REACHED; }
     void doHeaders(bool end_stream) override {
       parent_.decodeHeaders(this, *parent_.request_headers_, end_stream);
     }
@@ -369,6 +421,7 @@ private:
     const Buffer::Instance* decodingBuffer() override {
       return parent_.buffered_request_data_.get();
     }
+    void encode100ContinueHeaders(HeaderMapPtr&& headers) override;
     void encodeHeaders(HeaderMapPtr&& headers, bool end_stream) override;
     void encodeData(Buffer::Instance& data, bool end_stream) override;
     void encodeTrailers(HeaderMapPtr&& trailers) override;
@@ -400,9 +453,13 @@ private:
         : ActiveStreamFilterBase(parent, dual_filter), handle_(filter) {}
 
     // ActiveStreamFilterBase
+    bool canContinue() override { return true; }
     Buffer::WatermarkBufferPtr createBuffer() override;
     Buffer::WatermarkBufferPtr& bufferedData() override { return parent_.buffered_response_data_; }
     bool complete() override { return parent_.state_.local_complete_; }
+    void do100ContinueHeaders() override {
+      parent_.encode100ContinueHeaders(this, *parent_.continue_headers_);
+    }
     void doHeaders(bool end_stream) override {
       parent_.encodeHeaders(this, *parent_.response_headers_, end_stream);
     }
@@ -447,7 +504,7 @@ private:
 
     void addStreamDecoderFilterWorker(StreamDecoderFilterSharedPtr filter, bool dual_filter);
     void addStreamEncoderFilterWorker(StreamEncoderFilterSharedPtr filter, bool dual_filter);
-    void chargeStats(HeaderMap& headers);
+    void chargeStats(const HeaderMap& headers);
     std::list<ActiveStreamEncoderFilterPtr>::iterator
     commonEncodePrefix(ActiveStreamEncoderFilter* filter, bool end_stream);
     uint64_t connectionId();
@@ -458,6 +515,7 @@ private:
     void decodeData(ActiveStreamDecoderFilter* filter, Buffer::Instance& data, bool end_stream);
     void decodeTrailers(ActiveStreamDecoderFilter* filter, HeaderMap& trailers);
     void addEncodedData(ActiveStreamEncoderFilter& filter, Buffer::Instance& data, bool streaming);
+    void encode100ContinueHeaders(ActiveStreamEncoderFilter* filter, HeaderMap& headers);
     void encodeHeaders(ActiveStreamEncoderFilter* filter, HeaderMap& headers, bool end_stream);
     void encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instance& data, bool end_stream);
     void encodeTrailers(ActiveStreamEncoderFilter* filter, HeaderMap& trailers);
@@ -470,6 +528,7 @@ private:
     void onBelowWriteBufferLowWatermark() override;
 
     // Http::StreamDecoder
+    void decode100ContinueHeaders(HeaderMapPtr&&) override { NOT_REACHED; }
     void decodeHeaders(HeaderMapPtr&& headers, bool end_stream) override;
     void decodeData(Buffer::Instance& data, bool end_stream) override;
     void decodeTrailers(HeaderMapPtr&& trailers) override;
@@ -485,7 +544,7 @@ private:
       addStreamDecoderFilterWorker(filter, true);
       addStreamEncoderFilterWorker(filter, true);
     }
-    void addAccessLogHandler(Http::AccessLog::InstanceSharedPtr handler) override;
+    void addAccessLogHandler(AccessLog::InstanceSharedPtr handler) override;
 
     // Http::WsHandlerCallbacks
     void sendHeadersOnlyResponse(HeaderMap& headers) override {
@@ -496,7 +555,11 @@ private:
     virtual Tracing::OperationName operationName() const override;
     virtual const std::vector<Http::LowerCaseString>& requestHeadersForTags() const override;
 
-    // Pass on watermark callbacks to watermark subscribers.  This boils down to passing watermark
+    void traceRequest();
+
+    void refreshCachedRoute();
+
+    // Pass on watermark callbacks to watermark subscribers. This boils down to passing watermark
     // events for this stream and the downstream connection to the router filter.
     void callHighWatermarkCallbacks();
     void callLowWatermarkCallbacks();
@@ -512,6 +575,11 @@ private:
       static constexpr uint32_t EncodeHeaders   = 0x08;
       static constexpr uint32_t EncodeData      = 0x10;
       static constexpr uint32_t EncodeTrailers  = 0x20;
+      // Encode100ContinueHeaders is a bit of a special state as 100 continue
+      // headers may be sent during request processing. This state is only used
+      // to verify we do not encode100Continue headers more than once per
+      // filter.
+      static constexpr uint32_t Encode100ContinueHeaders  = 0x40;
     };
     // clang-format on
 
@@ -521,7 +589,7 @@ private:
 
       uint32_t filter_call_state_{0};
       // The following 3 members are booleans rather than part of the space-saving bitfield as they
-      // are passed as arguments to functions expecting bools.  Extend State using the bitfield
+      // are passed as arguments to functions expecting bools. Extend State using the bitfield
       // where possible.
       bool encoder_filters_streaming_{true};
       bool decoder_filters_streaming_{true};
@@ -536,9 +604,10 @@ private:
 
     ConnectionManagerImpl& connection_manager_;
     Router::ConfigConstSharedPtr snapped_route_config_;
-    Tracing::SpanPtr active_span_{new Tracing::NullSpan()};
+    Tracing::SpanPtr active_span_;
     const uint64_t stream_id_;
     StreamEncoder* response_encoder_{};
+    HeaderMapPtr continue_headers_;
     HeaderMapPtr response_headers_;
     Buffer::WatermarkBufferPtr buffered_response_data_;
     HeaderMapPtr response_trailers_{};
@@ -547,15 +616,18 @@ private:
     HeaderMapPtr request_trailers_;
     std::list<ActiveStreamDecoderFilterPtr> decoder_filters_;
     std::list<ActiveStreamEncoderFilterPtr> encoder_filters_;
-    std::list<Http::AccessLog::InstanceSharedPtr> access_log_handlers_;
+    std::list<AccessLog::InstanceSharedPtr> access_log_handlers_;
     Stats::TimespanPtr request_timer_;
     State state_;
-    AccessLog::RequestInfoImpl request_info_;
-    std::string downstream_address_;
+    RequestInfo::RequestInfoImpl request_info_;
     Optional<Router::RouteConstSharedPtr> cached_route_;
     DownstreamWatermarkCallbacks* watermark_callbacks_{nullptr};
     uint32_t buffer_limit_{0};
     uint32_t high_watermark_count_{0};
+    const std::string* decorated_operation_{nullptr};
+    // By default, we will assume there are no 100-Continue headers. If encode100ContinueHeaders
+    // is ever called, this is set to true so commonContinue resumes processing the 100-Continue.
+    bool has_continue_headers_{};
   };
 
   typedef std::unique_ptr<ActiveStream> ActiveStreamPtr;
@@ -604,6 +676,7 @@ private:
   Upstream::ClusterManager& cluster_manager_;
   WebSocket::WsHandlerImplPtr ws_connection_{};
   Network::ReadFilterCallbacks* read_callbacks_{};
+  ConnectionManagerListenerStats& listener_stats_;
 };
 
 } // Http

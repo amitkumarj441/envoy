@@ -10,6 +10,7 @@
 #include "common/common/assert.h"
 #include "common/common/empty_string.h"
 #include "common/common/enum_to_int.h"
+#include "common/common/fmt.h"
 #include "common/common/macros.h"
 #include "common/common/utility.h"
 #include "common/http/headers.h"
@@ -17,12 +18,45 @@
 #include "common/http/utility.h"
 #include "common/protobuf/protobuf.h"
 
-#include "fmt/format.h"
-
 namespace Envoy {
 namespace Grpc {
 
-const std::string Common::GRPC_CONTENT_TYPE{"application/grpc"};
+bool Common::hasGrpcContentType(const Http::HeaderMap& headers) {
+  const Http::HeaderEntry* content_type = headers.ContentType();
+  if (content_type == nullptr) {
+    return false;
+  }
+  // Fail fast if this is not gRPC.
+  if (!StringUtil::startsWith(content_type->value().c_str(),
+                              Http::Headers::get().ContentTypeValues.Grpc)) {
+    return false;
+  }
+  // Exact match with application/grpc. This and the above case are likely the
+  // two most common encountered.
+  if (content_type->value() == Http::Headers::get().ContentTypeValues.Grpc.c_str()) {
+    return true;
+  }
+  // Prefix match with application/grpc+. It's not sufficient to rely on the an
+  // application/grpc prefix match, since there are related content types such as
+  // application/grpc-web.
+  if (content_type->value().size() > Http::Headers::get().ContentTypeValues.Grpc.size() &&
+      content_type->value().c_str()[Http::Headers::get().ContentTypeValues.Grpc.size()] == '+') {
+    return true;
+  }
+  // This must be something like application/grpc-web.
+  return false;
+}
+
+bool Common::isGrpcResponseHeader(const Http::HeaderMap& headers, bool end_stream) {
+  if (end_stream) {
+    // Trailers-only response, only grpc-status is required.
+    return headers.GrpcStatus() != nullptr;
+  }
+  if (Http::Utility::getResponseStatus(headers) != enumToInt(Http::Code::OK)) {
+    return false;
+  }
+  return hasGrpcContentType(headers);
+}
 
 void Common::chargeStat(const Upstream::ClusterInfo& cluster, const std::string& protocol,
                         const std::string& grpc_service, const std::string& grpc_method,
@@ -81,12 +115,12 @@ bool Common::resolveServiceAndMethod(const Http::HeaderEntry* path, std::string*
   if (path == nullptr || path->value().c_str() == nullptr) {
     return false;
   }
-  std::vector<std::string> parts = StringUtil::split(path->value().c_str(), '/');
+  const auto parts = StringUtil::splitToken(path->value().c_str(), "/");
   if (parts.size() != 2) {
     return false;
   }
-  *service = std::move(parts[0]);
-  *method = std::move(parts[1]);
+  service->assign(parts[0].data(), parts[0].size());
+  method->assign(parts[1].data(), parts[1].size());
   return true;
 }
 
@@ -109,6 +143,66 @@ Status::GrpcStatus Common::httpToGrpcStatus(uint64_t http_response_status) {
     return Status::GrpcStatus::Unavailable;
   default:
     return Status::GrpcStatus::Unknown;
+  }
+}
+
+uint64_t Common::grpcToHttpStatus(Status::GrpcStatus grpc_status) {
+  // From https://cloud.google.com/apis/design/errors#handling_errors.
+  switch (grpc_status) {
+  case Status::GrpcStatus::Ok:
+    return 200;
+  case Status::GrpcStatus::Canceled:
+    // Client closed request.
+    return 499;
+  case Status::GrpcStatus::Unknown:
+    // Internal server error.
+    return 500;
+  case Status::GrpcStatus::InvalidArgument:
+    // Bad request.
+    return 400;
+  case Status::GrpcStatus::DeadlineExceeded:
+    // Gateway Time-out.
+    return 504;
+  case Status::GrpcStatus::NotFound:
+    // Not found.
+    return 404;
+  case Status::GrpcStatus::AlreadyExists:
+    // Conflict.
+    return 409;
+  case Status::GrpcStatus::PermissionDenied:
+    // Forbidden.
+    return 403;
+  case Status::GrpcStatus::ResourceExhausted:
+    //  Too many requests.
+    return 429;
+  case Status::GrpcStatus::FailedPrecondition:
+    // Bad request.
+    return 400;
+  case Status::GrpcStatus::Aborted:
+    // Conflict.
+    return 409;
+  case Status::GrpcStatus::OutOfRange:
+    // Bad request.
+    return 400;
+  case Status::GrpcStatus::Unimplemented:
+    // Not implemented.
+    return 501;
+  case Status::GrpcStatus::Internal:
+    // Internal server error.
+    return 500;
+  case Status::GrpcStatus::Unavailable:
+    // Service unavailable.
+    return 503;
+  case Status::GrpcStatus::DataLoss:
+    // Internal server error.
+    return 500;
+  case Status::GrpcStatus::Unauthenticated:
+    // Unauthorized.
+    return 401;
+  case Status::GrpcStatus::InvalidCode:
+  default:
+    // Internal server error.
+    return 500;
   }
 }
 
@@ -145,7 +239,8 @@ Http::MessagePtr Common::prepareHeaders(const std::string& upstream_cluster,
   message->headers().insertPath().value().append("/", 1);
   message->headers().insertPath().value().append(method_name.c_str(), method_name.size());
   message->headers().insertHost().value(upstream_cluster);
-  message->headers().insertContentType().value().setReference(Common::GRPC_CONTENT_TYPE);
+  message->headers().insertContentType().value().setReference(
+      Http::Headers::get().ContentTypeValues.Grpc);
   message->headers().insertTE().value().setReference(Http::Headers::get().TEValues.Trailers);
 
   return message;

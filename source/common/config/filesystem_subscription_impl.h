@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/api/v2/core/base.pb.h"
 #include "envoy/config/subscription.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/filesystem/filesystem.h"
@@ -9,8 +10,6 @@
 #include "common/config/utility.h"
 #include "common/protobuf/protobuf.h"
 #include "common/protobuf/utility.h"
-
-#include "api/base.pb.h"
 
 namespace Envoy {
 namespace Config {
@@ -63,6 +62,7 @@ private:
       config_update_available = true;
       callbacks_->onConfigUpdate(typed_resources);
       version_info_ = message.version_info();
+      stats_.version_.set(HashUtil::xxHash64(version_info_));
       stats_.update_success_.inc();
       ENVOY_LOG(debug, "Filesystem config update accepted for {}: {}", path_,
                 message.DebugString());

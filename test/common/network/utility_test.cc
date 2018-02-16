@@ -119,22 +119,6 @@ TEST(NetworkUtility, ParseInternetAddressAndPort) {
   EXPECT_EQ("[::1]:0", Utility::parseInternetAddressAndPort("[::1]:0")->asString());
 }
 
-TEST(NetworkUtility, FromProtoAddress) {
-  envoy::api::v2::Address ipv4_address;
-  ipv4_address.mutable_socket_address()->set_address("1.2.3.4");
-  ipv4_address.mutable_socket_address()->set_port_value(5);
-  EXPECT_EQ("1.2.3.4:5", Utility::fromProtoAddress(ipv4_address)->asString());
-
-  envoy::api::v2::Address ipv6_address;
-  ipv4_address.mutable_socket_address()->set_address("1::1");
-  ipv4_address.mutable_socket_address()->set_port_value(2);
-  EXPECT_EQ("[1::1]:2", Utility::fromProtoAddress(ipv4_address)->asString());
-
-  envoy::api::v2::Address pipe_address;
-  pipe_address.mutable_pipe()->set_path("/foo/bar");
-  EXPECT_EQ("/foo/bar", Utility::fromProtoAddress(pipe_address)->asString());
-}
-
 class NetworkUtilityGetLocalAddress : public testing::TestWithParam<Address::IpVersion> {};
 
 INSTANTIATE_TEST_CASE_P(IpVersions, NetworkUtilityGetLocalAddress,
@@ -147,27 +131,27 @@ TEST_P(NetworkUtilityGetLocalAddress, GetLocalAddress) {
 TEST(NetworkUtility, GetOriginalDst) { EXPECT_EQ(nullptr, Utility::getOriginalDst(-1)); }
 
 TEST(NetworkUtility, InternalAddress) {
-  EXPECT_TRUE(Utility::isInternalAddress("127.0.0.1"));
-  EXPECT_TRUE(Utility::isInternalAddress("10.0.0.1"));
-  EXPECT_TRUE(Utility::isInternalAddress("192.168.0.0"));
-  EXPECT_TRUE(Utility::isInternalAddress("172.16.0.0"));
-  EXPECT_TRUE(Utility::isInternalAddress("172.30.2.1"));
-  EXPECT_FALSE(Utility::isInternalAddress(""));
-  EXPECT_FALSE(Utility::isInternalAddress("127"));
-  EXPECT_FALSE(Utility::isInternalAddress("192.167.0.0"));
-  EXPECT_FALSE(Utility::isInternalAddress("172.32.0.0"));
-  EXPECT_FALSE(Utility::isInternalAddress("11.0.0.1"));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv4Instance("127.0.0.1")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv4Instance("10.0.0.1")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv4Instance("192.168.0.0")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv4Instance("172.16.0.0")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv4Instance("172.30.2.1")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv4Instance("192.167.0.0")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv4Instance("172.32.0.0")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv4Instance("11.0.0.1")));
 
-  EXPECT_TRUE(Utility::isInternalAddress("fd00::"));
-  EXPECT_TRUE(Utility::isInternalAddress("::1"));
-  EXPECT_TRUE(Utility::isInternalAddress("fdff::"));
-  EXPECT_TRUE(Utility::isInternalAddress("fd01::"));
-  EXPECT_TRUE(Utility::isInternalAddress("fd12:3456:7890:1234:5678:9012:3456:7890"));
-  EXPECT_FALSE(Utility::isInternalAddress("fd::"));
-  EXPECT_FALSE(Utility::isInternalAddress("::"));
-  EXPECT_FALSE(Utility::isInternalAddress("fc00::"));
-  EXPECT_FALSE(Utility::isInternalAddress("fe00::"));
-  EXPECT_FALSE(Utility::isInternalAddress("fd00:::"));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv6Instance("fd00::")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv6Instance("::1")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv6Instance("fdff::")));
+  EXPECT_TRUE(Utility::isInternalAddress(Address::Ipv6Instance("fd01::")));
+  EXPECT_TRUE(
+      Utility::isInternalAddress(Address::Ipv6Instance("fd12:3456:7890:1234:5678:9012:3456:7890")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv6Instance("fd::")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv6Instance("::")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv6Instance("fc00::")));
+  EXPECT_FALSE(Utility::isInternalAddress(Address::Ipv6Instance("fe00::")));
+
+  EXPECT_FALSE(Utility::isInternalAddress(Address::PipeInstance("/hello")));
 }
 
 TEST(NetworkUtility, LoopbackAddress) {
@@ -211,6 +195,24 @@ TEST(NetworkUtility, AnyAddress) {
     EXPECT_EQ(any->ip()->version(), Address::IpVersion::v6);
     EXPECT_EQ(any->asString(), "[::]:0");
     EXPECT_EQ(any, Utility::getIpv6AnyAddress());
+  }
+}
+
+TEST(NetworkUtility, AddressToProtobufAddress) {
+  {
+    envoy::api::v2::core::Address proto_address;
+    Address::Ipv4Instance address("127.0.0.1");
+    Utility::addressToProtobufAddress(address, proto_address);
+    EXPECT_EQ(true, proto_address.has_socket_address());
+    EXPECT_EQ("127.0.0.1", proto_address.socket_address().address());
+    EXPECT_EQ(0, proto_address.socket_address().port_value());
+  }
+  {
+    envoy::api::v2::core::Address proto_address;
+    Address::PipeInstance address("/hello");
+    Utility::addressToProtobufAddress(address, proto_address);
+    EXPECT_EQ(true, proto_address.has_pipe());
+    EXPECT_EQ("/hello", proto_address.pipe().path());
   }
 }
 
@@ -286,6 +288,47 @@ TEST(PortRangeListTest, Normal) {
     EXPECT_FALSE(Utility::portInRangeList(makeFromPort(2), port_range_list));
     EXPECT_FALSE(Utility::portInRangeList(makeFromPort(200), port_range_list));
     EXPECT_FALSE(Utility::portInRangeList(makeFromPort(20000), port_range_list));
+  }
+}
+
+// TODO(ccaraman): Support big-endian. These tests operate under the assumption that the machine
+// byte order is little-endian.
+TEST(AbslUint128, TestByteOrder) {
+  {
+    Address::Ipv6Instance address("::1");
+    uint64_t high = 0x100000000000000;
+    EXPECT_EQ(absl::MakeUint128(high, 0), address.ip()->ipv6()->address());
+    EXPECT_EQ(absl::MakeUint128(high, 0),
+              Utility::Ip6htonl(Utility::Ip6ntohl(address.ip()->ipv6()->address())));
+
+    EXPECT_EQ(absl::uint128(1), Utility::Ip6ntohl(address.ip()->ipv6()->address()));
+  }
+  {
+    Address::Ipv6Instance address("1::");
+    EXPECT_EQ(absl::uint128(256), address.ip()->ipv6()->address());
+    EXPECT_EQ(absl::uint128(256),
+              Utility::Ip6htonl(Utility::Ip6ntohl(address.ip()->ipv6()->address())));
+
+    uint64_t high = 0x001000000000000;
+    EXPECT_EQ(absl::MakeUint128(high, 0), Utility::Ip6ntohl(address.ip()->ipv6()->address()));
+  }
+  {
+    Address::Ipv6Instance address("2001:abcd:ef01:2345:6789:abcd:ef01:234");
+    uint64_t low = 0x452301EFCDAB0120;
+    uint64_t high = 0x340201EFCDAB8967;
+    EXPECT_EQ(absl::MakeUint128(high, low), address.ip()->ipv6()->address());
+    EXPECT_EQ(absl::MakeUint128(high, low),
+              Utility::Ip6htonl(Utility::Ip6ntohl(address.ip()->ipv6()->address())));
+  }
+  {
+    Address::Ipv6Instance address("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
+    EXPECT_EQ(absl::Uint128Max(), address.ip()->ipv6()->address());
+    EXPECT_EQ(absl::Uint128Max(), Utility::Ip6ntohl(address.ip()->ipv6()->address()));
+  }
+  {
+    TestRandomGenerator rand;
+    absl::uint128 random_number = absl::MakeUint128(rand.random(), rand.random());
+    EXPECT_EQ(random_number, Utility::Ip6htonl(Utility::Ip6ntohl(random_number)));
   }
 }
 

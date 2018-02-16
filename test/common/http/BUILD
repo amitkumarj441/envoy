@@ -54,6 +54,16 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "codec_wrappers_test",
+    srcs = ["codec_wrappers_test.cc"],
+    deps = [
+        "//source/common/http:codec_wrappers_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "codes_test",
     srcs = ["codes_test.cc"],
     deps = [
@@ -82,10 +92,12 @@ envoy_cc_test(
     name = "conn_manager_impl_test",
     srcs = ["conn_manager_impl_test.cc"],
     deps = [
+        "//include/envoy/access_log:access_log_interface",
         "//include/envoy/buffer:buffer_interface",
         "//include/envoy/event:dispatcher_interface",
-        "//include/envoy/http:access_log_interface",
         "//include/envoy/tracing:http_tracer_interface",
+        "//source/common/access_log:access_log_formatter_lib",
+        "//source/common/access_log:access_log_lib",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:macros",
         "//source/common/event:dispatcher_lib",
@@ -94,8 +106,6 @@ envoy_cc_test(
         "//source/common/http:exception_lib",
         "//source/common/http:header_map_lib",
         "//source/common/http:headers_lib",
-        "//source/common/http/access_log:access_log_formatter_lib",
-        "//source/common/http/access_log:access_log_lib",
         "//source/common/network:address_lib",
         "//source/common/stats:stats_lib",
         "//source/common/upstream:upstream_includes",

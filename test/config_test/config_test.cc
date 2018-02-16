@@ -1,6 +1,9 @@
+#include <unistd.h>
+
 #include <cstdint>
 #include <string>
 
+#include "common/common/fmt.h"
 #include "common/protobuf/utility.h"
 #include "common/upstream/cluster_manager_impl.h"
 
@@ -11,7 +14,6 @@
 #include "test/mocks/ssl/mocks.h"
 #include "test/test_common/utility.h"
 
-#include "fmt/format.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -33,14 +35,9 @@ public:
     ON_CALL(server_.api_, fileReadToEnd("lightstep_access_token"))
         .WillByDefault(Return("access_token"));
 
-    envoy::api::v2::Bootstrap bootstrap;
-    try {
-      MessageUtil::loadFromFile(file_path, bootstrap);
-    } catch (const EnvoyException& e) {
-      // TODO(htuch): When v1 is deprecated, make this a warning encouraging config upgrade.
-      Json::ObjectSharedPtr config_json = Json::Factory::loadFromFile(file_path);
-      bootstrap = TestUtility::parseBootstrapFromJson(config_json->asJsonString());
-    }
+    envoy::config::bootstrap::v2::Bootstrap bootstrap;
+    Server::InstanceUtil::loadBootstrapConfig(bootstrap, options_.configPath(),
+                                              options_.v2ConfigOnly());
     Server::Configuration::InitialImpl initial_config(bootstrap);
     Server::Configuration::MainImpl main_config;
 
@@ -52,12 +49,22 @@ public:
       return main_config.clusterManager();
     }));
     ON_CALL(server_, listenerManager()).WillByDefault(ReturnRef(listener_manager_));
-    ON_CALL(component_factory_, createFilterFactoryList(_, _))
-        .WillByDefault(Invoke([&](const Protobuf::RepeatedPtrField<envoy::api::v2::Filter>& filters,
-                                  Server::Configuration::FactoryContext& context)
-                                  -> std::vector<Server::Configuration::NetworkFilterFactoryCb> {
-          return Server::ProdListenerComponentFactory::createFilterFactoryList_(filters, context);
-        }));
+    ON_CALL(component_factory_, createNetworkFilterFactoryList(_, _))
+        .WillByDefault(
+            Invoke([&](const Protobuf::RepeatedPtrField<envoy::api::v2::listener::Filter>& filters,
+                       Server::Configuration::FactoryContext& context)
+                       -> std::vector<Server::Configuration::NetworkFilterFactoryCb> {
+              return Server::ProdListenerComponentFactory::createNetworkFilterFactoryList_(filters,
+                                                                                           context);
+            }));
+    ON_CALL(component_factory_, createListenerFilterFactoryList(_, _))
+        .WillByDefault(Invoke(
+            [&](const Protobuf::RepeatedPtrField<envoy::api::v2::listener::ListenerFilter>& filters,
+                Server::Configuration::ListenerFactoryContext& context)
+                -> std::vector<Server::Configuration::ListenerFilterFactoryCb> {
+              return Server::ProdListenerComponentFactory::createListenerFilterFactoryList_(
+                  filters, context);
+            }));
 
     try {
       main_config.initialize(bootstrap, server_, *cluster_manager_factory_);
@@ -79,11 +86,17 @@ public:
 };
 
 uint32_t run(const std::string& directory) {
+  // Change working directory, otherwise we won't be able to read files using relative paths.
+  char cwd[PATH_MAX];
+  RELEASE_ASSERT(::getcwd(cwd, PATH_MAX) != nullptr);
+  RELEASE_ASSERT(::chdir(directory.c_str()) == 0);
   uint32_t num_tested = 0;
-  for (const std::string& filename : TestUtility::listFiles(directory, true)) {
+  for (const std::string& filename : TestUtility::listFiles(directory, false)) {
     ConfigTest config(filename);
     num_tested++;
   }
+  // Return to the original working directory, otherwise "bazel.coverage" breaks (...but why?).
+  RELEASE_ASSERT(::chdir(cwd) == 0);
   return num_tested;
 }
 

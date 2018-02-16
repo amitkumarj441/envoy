@@ -3,25 +3,22 @@
 #include <cstdint>
 #include <string>
 
-#include "common/common/empty_string.h"
-#include "common/json/config_schemas.h"
-
-#include "fmt/format.h"
+#include "common/common/fmt.h"
+#include "common/tracing/http_tracer_impl.h"
 
 namespace Envoy {
 namespace RateLimit {
 namespace TcpFilter {
 
-Config::Config(const Json::Object& config, Stats::Scope& scope, Runtime::Loader& runtime)
-    : domain_(config.getString("domain")),
-      stats_(generateStats(config.getString("stat_prefix"), scope)), runtime_(runtime) {
+Config::Config(const envoy::config::filter::network::rate_limit::v2::RateLimit& config,
+               Stats::Scope& scope, Runtime::Loader& runtime)
+    : domain_(config.domain()), stats_(generateStats(config.stat_prefix(), scope)),
+      runtime_(runtime) {
 
-  config.validateSchema(Json::Schema::RATELIMIT_NETWORK_FILTER_SCHEMA);
-
-  for (const Json::ObjectSharedPtr& descriptor : config.getObjectArray("descriptors")) {
+  for (const auto& descriptor : config.descriptors()) {
     Descriptor new_descriptor;
-    for (const Json::ObjectSharedPtr& entry : descriptor->asObjectArray()) {
-      new_descriptor.entries_.push_back({entry->getString("key"), entry->getString("value")});
+    for (const auto& entry : descriptor.entries()) {
+      new_descriptor.entries_.push_back({entry.key(), entry.value()});
     }
     descriptors_.push_back(new_descriptor);
   }
@@ -33,7 +30,7 @@ InstanceStats Config::generateStats(const std::string& name, Stats::Scope& scope
                                    POOL_GAUGE_PREFIX(scope, final_prefix))};
 }
 
-Network::FilterStatus Instance::onData(Buffer::Instance&) {
+Network::FilterStatus Instance::onData(Buffer::Instance&, bool) {
   return status_ == Status::Calling ? Network::FilterStatus::StopIteration
                                     : Network::FilterStatus::Continue;
 }
@@ -49,7 +46,7 @@ Network::FilterStatus Instance::onNewConnection() {
     config_->stats().active_.inc();
     config_->stats().total_.inc();
     calling_limit_ = true;
-    client_->limit(*this, config_->domain(), config_->descriptors(), Tracing::EMPTY_CONTEXT);
+    client_->limit(*this, config_->domain(), config_->descriptors(), Tracing::NullSpan::instance());
     calling_limit_ = false;
   }
 

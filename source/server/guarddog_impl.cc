@@ -4,10 +4,9 @@
 #include <mutex>
 
 #include "common/common/assert.h"
+#include "common/common/fmt.h"
 
 #include "server/watchdog_impl.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Server {
@@ -110,7 +109,7 @@ void GuardDogImpl::stopWatching(WatchDogSharedPtr wd) {
 bool GuardDogImpl::waitOrDetectStop() {
   force_checked_event_.notify_all();
   std::lock_guard<std::mutex> guard(exit_lock_);
-  // Spurious wakeups are OK without explicit handling.  We'll just check
+  // Spurious wakeups are OK without explicit handling. We'll just check
   // earlier than strictly required for that round.
   exit_event_.wait_for(exit_lock_, std::chrono::milliseconds(loop_interval_));
   return run_thread_;

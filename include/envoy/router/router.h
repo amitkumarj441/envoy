@@ -8,28 +8,66 @@
 #include <memory>
 #include <string>
 
+#include "envoy/access_log/access_log.h"
+#include "envoy/api/v2/core/base.pb.h"
 #include "envoy/common/optional.h"
 #include "envoy/http/codec.h"
+#include "envoy/http/codes.h"
 #include "envoy/http/header_map.h"
 #include "envoy/tracing/http_tracer.h"
 #include "envoy/upstream/resource_manager.h"
+
+#include "common/protobuf/protobuf.h"
+#include "common/protobuf/utility.h"
 
 namespace Envoy {
 namespace Router {
 
 /**
- * A routing primitive that creates a redirect path.
+ * Functionality common among routing primitives, such as DirectResponseEntry and RouteEntry.
  */
-class RedirectEntry {
+class ResponseEntry {
 public:
-  virtual ~RedirectEntry() {}
+  virtual ~ResponseEntry() {}
+
+  /**
+   * Do potentially destructive header transforms on response headers prior to forwarding. For
+   * example, adding or removing headers. This should only be called ONCE immediately after
+   * obtaining the initial response headers.
+   * @param headers supplies the response headers, which may be modified during this call.
+   * @param request_info holds additional information about the request.
+   */
+  virtual void finalizeResponseHeaders(Http::HeaderMap& headers,
+                                       const RequestInfo::RequestInfo& request_info) const PURE;
+};
+
+/**
+ * A routing primitive that specifies a direct (non-proxied) HTTP response.
+ */
+class DirectResponseEntry : public ResponseEntry {
+public:
+  virtual ~DirectResponseEntry() {}
+
+  /**
+   * Returns the HTTP status code to return.
+   * @return Http::Code the response Code.
+   */
+  virtual Http::Code responseCode() const PURE;
 
   /**
    * Returns the redirect path based on the request headers.
    * @param headers supplies the request headers.
-   * @return std::string the redirect URL.
+   * @return std::string the redirect URL if this DirectResponseEntry is a redirect,
+   *         or an empty string otherwise.
    */
   virtual std::string newPath(const Http::HeaderMap& headers) const PURE;
+
+  /**
+   * Returns the response body to send with direct responses.
+   * @return std::string& the response body specified in the route configuration,
+   *         or an empty string if no response body is specified.
+   */
+  virtual const std::string& responseBody() const PURE;
 };
 
 /**
@@ -82,12 +120,13 @@ class RetryPolicy {
 public:
   // clang-format off
   static const uint32_t RETRY_ON_5XX                     = 0x1;
-  static const uint32_t RETRY_ON_CONNECT_FAILURE         = 0x2;
-  static const uint32_t RETRY_ON_RETRIABLE_4XX           = 0x4;
-  static const uint32_t RETRY_ON_REFUSED_STREAM          = 0x8;
-  static const uint32_t RETRY_ON_GRPC_CANCELLED          = 0x10;
-  static const uint32_t RETRY_ON_GRPC_DEADLINE_EXCEEDED  = 0x20;
-  static const uint32_t RETRY_ON_GRPC_RESOURCE_EXHAUSTED = 0x40;
+  static const uint32_t RETRY_ON_GATEWAY_ERROR           = 0x2;
+  static const uint32_t RETRY_ON_CONNECT_FAILURE         = 0x4;
+  static const uint32_t RETRY_ON_RETRIABLE_4XX           = 0x8;
+  static const uint32_t RETRY_ON_REFUSED_STREAM          = 0x10;
+  static const uint32_t RETRY_ON_GRPC_CANCELLED          = 0x20;
+  static const uint32_t RETRY_ON_GRPC_DEADLINE_EXCEEDED  = 0x40;
+  static const uint32_t RETRY_ON_GRPC_RESOURCE_EXHAUSTED = 0x80;
   // clang-format on
 
   virtual ~RetryPolicy() {}
@@ -182,6 +221,7 @@ public:
 };
 
 class RateLimitPolicy;
+class Config;
 
 /**
  * Virtual host defintion.
@@ -204,6 +244,11 @@ public:
    * @return const RateLimitPolicy& the rate limit policy for the virtual host.
    */
   virtual const RateLimitPolicy& rateLimitPolicy() const PURE;
+
+  /**
+   * @return const Config& the RouteConfiguration that owns this virtual host.
+   */
+  virtual const Config& routeConfig() const PURE;
 };
 
 /**
@@ -215,18 +260,90 @@ public:
   virtual ~HashPolicy() {}
 
   /**
-   * @return Optional<uint64_t> an optional hash value to route on given a set of HTTP headers.
-   *         A hash value might not be returned if for example the specified HTTP header does not
-   *         exist. In the future we might add additional support for hashing on origin address,
-   *         etc.
+   * A callback used for requesting that a cookie be set with the given lifetime.
+   * @param key the name of the cookie to be set
+   * @param ttl the lifetime of the cookie
+   * @return std::string the opaque value of the cookie that will be set
    */
-  virtual Optional<uint64_t> generateHash(const Http::HeaderMap& headers) const PURE;
+  typedef std::function<std::string(const std::string& key, std::chrono::seconds ttl)>
+      AddCookieCallback;
+
+  /**
+   * @param downstream_address contains the address of the connected client host, or an
+   * empty string if the request is initiated from within this host
+   * @param headers stores the HTTP headers for the stream
+   * @param add_cookie is called to add a set-cookie header on the reply sent to the downstream
+   * host
+   * @return Optional<uint64_t> an optional hash value to route on. A hash value might not be
+   * returned if for example the specified HTTP header does not exist.
+   */
+  virtual Optional<uint64_t> generateHash(const std::string& downstream_address,
+                                          const Http::HeaderMap& headers,
+                                          AddCookieCallback add_cookie) const PURE;
+};
+
+class MetadataMatchCriterion {
+public:
+  virtual ~MetadataMatchCriterion() {}
+
+  /*
+   * @return const std::string& the name of the metadata key
+   */
+  virtual const std::string& name() const PURE;
+
+  /*
+   * @return const Envoy::HashedValue& the value for the metadata key
+   */
+  virtual const HashedValue& value() const PURE;
+};
+
+typedef std::shared_ptr<const MetadataMatchCriterion> MetadataMatchCriterionConstSharedPtr;
+
+class MetadataMatchCriteria {
+public:
+  virtual ~MetadataMatchCriteria() {}
+
+  /*
+   * @return std::vector<MetadataMatchCriterionConstSharedPtr>& a vector of
+   * metadata to be matched against upstream endpoints when load
+   * balancing, sorted lexically by name.
+   */
+  virtual const std::vector<MetadataMatchCriterionConstSharedPtr>&
+  metadataMatchCriteria() const PURE;
+};
+
+/**
+ * Type of path matching that a route entry uses.
+ */
+enum class PathMatchType {
+  None,
+  Prefix,
+  Exact,
+  Regex,
+};
+
+/**
+ * Criterion that a route entry uses for matching a particular path.
+ */
+class PathMatchCriterion {
+public:
+  virtual ~PathMatchCriterion() {}
+
+  /**
+   * @return PathMatchType type of path match.
+   */
+  virtual PathMatchType matchType() const PURE;
+
+  /**
+   * @return const std::string& the string with which to compare paths.
+   */
+  virtual const std::string& matcher() const PURE;
 };
 
 /**
  * An individual resolved route entry.
  */
-class RouteEntry {
+class RouteEntry : public ResponseEntry {
 public:
   virtual ~RouteEntry() {}
 
@@ -234,6 +351,12 @@ public:
    * @return const std::string& the upstream cluster that owns the route.
    */
   virtual const std::string& clusterName() const PURE;
+
+  /**
+   * Returns the HTTP status code to use when configured cluster is not found.
+   * @return Http::Code to use when configured cluster is not found.
+   */
+  virtual Http::Code clusterNotFoundResponseCode() const PURE;
 
   /**
    * @return const CorsPolicy* the CORS policy for this virtual host.
@@ -245,8 +368,10 @@ public:
    * example URL prefix rewriting, adding headers, etc. This should only be called ONCE
    * immediately prior to forwarding. It is done this way vs. copying for performance reasons.
    * @param headers supplies the request headers, which may be modified during this call.
+   * @param request_info holds additional information about the request.
    */
-  virtual void finalizeRequestHeaders(Http::HeaderMap& headers) const PURE;
+  virtual void finalizeRequestHeaders(Http::HeaderMap& headers,
+                                      const RequestInfo::RequestInfo& request_info) const PURE;
 
   /**
    * @return const HashPolicy* the optional hash policy for the route.
@@ -303,6 +428,12 @@ public:
   virtual bool useWebSocket() const PURE;
 
   /**
+   * @return MetadataMatchCriteria* the metadata that a subset load balancer should match when
+   * selecting an upstream host
+   */
+  virtual const MetadataMatchCriteria* metadataMatchCriteria() const PURE;
+
+  /**
    * @return const std::multimap<std::string, std::string> the opaque configuration associated
    *         with the route
    */
@@ -312,6 +443,17 @@ public:
    * @return bool true if the virtual host rate limits should be included.
    */
   virtual bool includeVirtualHostRateLimits() const PURE;
+
+  /**
+   * @return const envoy::api::v2::core::Metadata& return the metadata provided in the config for
+   * this route.
+   */
+  virtual const envoy::api::v2::core::Metadata& metadata() const PURE;
+
+  /**
+   * @return const PathMatchCriterion& the match criterion for this route.
+   */
+  virtual const PathMatchCriterion& pathMatchCriterion() const PURE;
 };
 
 /**
@@ -326,21 +468,27 @@ public:
    * @param Tracing::Span& the span.
    */
   virtual void apply(Tracing::Span& span) const PURE;
+
+  /**
+   * This method returns the operation name.
+   * @return the operation name
+   */
+  virtual const std::string& getOperation() const PURE;
 };
 
 typedef std::unique_ptr<const Decorator> DecoratorConstPtr;
 
 /**
- * An interface that holds a RedirectEntry or a RouteEntry for a request.
+ * An interface that holds a DirectResponseEntry or RouteEntry for a request.
  */
 class Route {
 public:
   virtual ~Route() {}
 
   /**
-   * @return the redirect entry or nullptr if there is no redirect needed for the request.
+   * @return the direct response entry or nullptr if there is no direct response for the request.
    */
-  virtual const RedirectEntry* redirectEntry() const PURE;
+  virtual const DirectResponseEntry* directResponseEntry() const PURE;
 
   /**
    * @return the route entry or nullptr if there is no matching route for the request.
@@ -364,7 +512,7 @@ public:
 
   /**
    * Based on the incoming HTTP request headers, determine the target route (containing either a
-   * route entry or a redirect entry) for the request.
+   * route entry or a direct response entry) for the request.
    * @param headers supplies the request headers.
    * @param random_value supplies the random seed to use if a runtime choice is required. This
    *        allows stable choices between calls if desired.
@@ -380,24 +528,9 @@ public:
   virtual const std::list<Http::LowerCaseString>& internalOnlyHeaders() const PURE;
 
   /**
-   * Return a list of header key/value pairs that will be added to every response that transits the
-   * router.
+   * @return const std::string the RouteConfiguration name.
    */
-  virtual const std::list<std::pair<Http::LowerCaseString, std::string>>&
-  responseHeadersToAdd() const PURE;
-
-  /**
-   * Return a list of upstream headers that will be stripped from every response that transits the
-   * router.
-   */
-  virtual const std::list<Http::LowerCaseString>& responseHeadersToRemove() const PURE;
-
-  /**
-   * Return whether the configuration makes use of runtime or not. Callers can use this to
-   * determine whether they should use a fast or slow source of randomness when calling route
-   * functions.
-   */
-  virtual bool usesRuntime() const PURE;
+  virtual const std::string& name() const PURE;
 };
 
 typedef std::shared_ptr<const Config> ConfigConstSharedPtr;

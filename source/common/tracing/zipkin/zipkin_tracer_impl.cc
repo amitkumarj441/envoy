@@ -1,6 +1,7 @@
 #include "common/tracing/zipkin/zipkin_tracer_impl.h"
 
 #include "common/common/enum_to_int.h"
+#include "common/common/fmt.h"
 #include "common/common/utility.h"
 #include "common/http/headers.h"
 #include "common/http/message_impl.h"
@@ -8,17 +9,12 @@
 #include "common/tracing/http_tracer_impl.h"
 #include "common/tracing/zipkin/zipkin_core_constants.h"
 
-#include "fmt/format.h"
-
 namespace Envoy {
 namespace Zipkin {
 
 ZipkinSpan::ZipkinSpan(Zipkin::Span& span, Zipkin::Tracer& tracer) : span_(span), tracer_(tracer) {}
 
-void ZipkinSpan::finishSpan(Tracing::SpanFinalizer& finalizer) {
-  finalizer.finalize(*this);
-  span_.finish();
-}
+void ZipkinSpan::finishSpan() { span_.finish(); }
 
 void ZipkinSpan::setOperation(const std::string& operation) { span_.setName(operation); }
 

@@ -11,8 +11,16 @@
 namespace Envoy {
 namespace Config {
 
+void CdsJson::translateRingHashLbConfig(
+    const Json::Object& json_ring_hash_lb_config,
+    envoy::api::v2::Cluster::RingHashLbConfig& ring_hash_lb_config) {
+  JSON_UTIL_SET_INTEGER(json_ring_hash_lb_config, ring_hash_lb_config, minimum_ring_size);
+  JSON_UTIL_SET_BOOL(json_ring_hash_lb_config, *ring_hash_lb_config.mutable_deprecated_v1(),
+                     use_std_hash);
+}
+
 void CdsJson::translateHealthCheck(const Json::Object& json_health_check,
-                                   envoy::api::v2::HealthCheck& health_check) {
+                                   envoy::api::v2::core::HealthCheck& health_check) {
   json_health_check.validateSchema(Json::Schema::CLUSTER_HEALTH_CHECK_SCHEMA);
 
   JSON_UTIL_SET_DURATION(json_health_check, health_check, timeout);
@@ -20,6 +28,7 @@ void CdsJson::translateHealthCheck(const Json::Object& json_health_check,
   JSON_UTIL_SET_DURATION(json_health_check, health_check, interval_jitter);
   JSON_UTIL_SET_INTEGER(json_health_check, health_check, unhealthy_threshold);
   JSON_UTIL_SET_INTEGER(json_health_check, health_check, healthy_threshold);
+  JSON_UTIL_SET_BOOL(json_health_check, health_check, reuse_connection);
 
   const std::string hc_type = json_health_check.getString("type");
   if (hc_type == "http") {
@@ -35,7 +44,9 @@ void CdsJson::translateHealthCheck(const Json::Object& json_health_check,
       const std::string hex_string = entry->getString("binary");
       send_text += hex_string;
     }
-    tcp_health_check->mutable_send()->set_text(send_text);
+    if (!send_text.empty()) {
+      tcp_health_check->mutable_send()->set_text(send_text);
+    }
     for (const Json::ObjectSharedPtr& entry : json_health_check.getObjectArray("receive")) {
       const std::string hex_string = entry->getString("binary");
       tcp_health_check->mutable_receive()->Add()->set_text(hex_string);
@@ -46,9 +57,9 @@ void CdsJson::translateHealthCheck(const Json::Object& json_health_check,
   }
 }
 
-void CdsJson::translateThresholds(const Json::Object& json_thresholds,
-                                  const envoy::api::v2::RoutingPriority& priority,
-                                  envoy::api::v2::CircuitBreakers::Thresholds& thresholds) {
+void CdsJson::translateThresholds(
+    const Json::Object& json_thresholds, const envoy::api::v2::core::RoutingPriority& priority,
+    envoy::api::v2::cluster::CircuitBreakers::Thresholds& thresholds) {
   thresholds.set_priority(priority);
   JSON_UTIL_SET_INTEGER(json_thresholds, thresholds, max_connections);
   JSON_UTIL_SET_INTEGER(json_thresholds, thresholds, max_pending_requests);
@@ -57,23 +68,26 @@ void CdsJson::translateThresholds(const Json::Object& json_thresholds,
 }
 
 void CdsJson::translateCircuitBreakers(const Json::Object& json_circuit_breakers,
-                                       envoy::api::v2::CircuitBreakers& circuit_breakers) {
+                                       envoy::api::v2::cluster::CircuitBreakers& circuit_breakers) {
   translateThresholds(*json_circuit_breakers.getObject("default", true),
-                      envoy::api::v2::RoutingPriority::DEFAULT,
+                      envoy::api::v2::core::RoutingPriority::DEFAULT,
                       *circuit_breakers.mutable_thresholds()->Add());
   translateThresholds(*json_circuit_breakers.getObject("high", true),
-                      envoy::api::v2::RoutingPriority::HIGH,
+                      envoy::api::v2::core::RoutingPriority::HIGH,
                       *circuit_breakers.mutable_thresholds()->Add());
 }
 
 void CdsJson::translateOutlierDetection(
     const Json::Object& json_outlier_detection,
-    envoy::api::v2::Cluster::OutlierDetection& outlier_detection) {
+    envoy::api::v2::cluster::OutlierDetection& outlier_detection) {
   JSON_UTIL_SET_DURATION(json_outlier_detection, outlier_detection, interval);
   JSON_UTIL_SET_DURATION(json_outlier_detection, outlier_detection, base_ejection_time);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, consecutive_5xx);
+  JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, consecutive_gateway_failure);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, max_ejection_percent);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, enforcing_consecutive_5xx);
+  JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection,
+                        enforcing_consecutive_gateway_failure);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, enforcing_success_rate);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, success_rate_minimum_hosts);
   JSON_UTIL_SET_INTEGER(json_outlier_detection, outlier_detection, success_rate_request_volume);
@@ -81,17 +95,21 @@ void CdsJson::translateOutlierDetection(
 }
 
 void CdsJson::translateCluster(const Json::Object& json_cluster,
-                               const Optional<envoy::api::v2::ConfigSource>& eds_config,
+                               const Optional<envoy::api::v2::core::ConfigSource>& eds_config,
                                envoy::api::v2::Cluster& cluster) {
   json_cluster.validateSchema(Json::Schema::CLUSTER_SCHEMA);
-  cluster.set_name(json_cluster.getString("name"));
+
+  const std::string name = json_cluster.getString("name");
+  Utility::checkObjNameLength("Invalid cluster name", name);
+  cluster.set_name(name);
+
   const std::string string_type = json_cluster.getString("type");
   auto set_dns_hosts = [&json_cluster, &cluster] {
     const auto hosts = json_cluster.getObjectArray("hosts");
     std::transform(hosts.cbegin(), hosts.cend(),
                    Protobuf::RepeatedPtrFieldBackInserter(cluster.mutable_hosts()),
                    [](const Json::ObjectSharedPtr& host) {
-                     envoy::api::v2::Address address;
+                     envoy::api::v2::core::Address address;
                      AddressJson::translateAddress(host->getString("url"), true, false, address);
                      return address;
                    });
@@ -102,7 +120,7 @@ void CdsJson::translateCluster(const Json::Object& json_cluster,
     std::transform(hosts.cbegin(), hosts.cend(),
                    Protobuf::RepeatedPtrFieldBackInserter(cluster.mutable_hosts()),
                    [](const Json::ObjectSharedPtr& host) {
-                     envoy::api::v2::Address address;
+                     envoy::api::v2::core::Address address;
                      AddressJson::translateAddress(host->getString("url"), true, true, address);
                      return address;
                    });
@@ -142,6 +160,11 @@ void CdsJson::translateCluster(const Json::Object& json_cluster,
     cluster.set_lb_policy(envoy::api::v2::Cluster::RING_HASH);
   }
 
+  if (json_cluster.hasObject("ring_hash_lb_config")) {
+    translateRingHashLbConfig(*json_cluster.getObject("ring_hash_lb_config"),
+                              *cluster.mutable_ring_hash_lb_config());
+  }
+
   if (json_cluster.hasObject("health_check")) {
     translateHealthCheck(*json_cluster.getObject("health_check"),
                          *cluster.mutable_health_checks()->Add());
@@ -179,7 +202,7 @@ void CdsJson::translateCluster(const Json::Object& json_cluster,
     std::transform(dns_resolvers.cbegin(), dns_resolvers.cend(),
                    Protobuf::RepeatedPtrFieldBackInserter(cluster.mutable_dns_resolvers()),
                    [](const std::string& json_address) {
-                     envoy::api::v2::Address address;
+                     envoy::api::v2::core::Address address;
                      AddressJson::translateAddress(json_address, false, true, address);
                      return address;
                    });

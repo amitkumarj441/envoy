@@ -5,13 +5,12 @@
 #include <string>
 #include <vector>
 
+#include "common/common/fmt.h"
 #include "common/config/utility.h"
 #include "common/network/address_impl.h"
 #include "common/network/utility.h"
 #include "common/protobuf/protobuf.h"
 #include "common/protobuf/utility.h"
-
-#include "fmt/format.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -27,7 +26,7 @@ LogicalDnsCluster::LogicalDnsCluster(const envoy::api::v2::Cluster& cluster,
       dns_resolver_(dns_resolver),
       dns_refresh_rate_ms_(
           std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(cluster, dns_refresh_rate, 5000))),
-      tls_(tls.allocateSlot()), initialized_(false),
+      tls_(tls.allocateSlot()),
       resolve_timer_(dispatcher.createTimer([this]() -> void { startResolve(); })) {
   const auto& hosts = cluster.hosts();
   if (hosts.size() != 1) {
@@ -53,14 +52,12 @@ LogicalDnsCluster::LogicalDnsCluster(const envoy::api::v2::Cluster& cluster,
   hostname_ = Network::Utility::hostFromTcpUrl(dns_url_);
   Network::Utility::portFromTcpUrl(dns_url_);
 
-  // This must come before startResolve(), since the resolve callback relies on
-  // tls_slot_ being initialized.
   tls_->set([](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
     return std::make_shared<PerThreadCurrentHostData>();
   });
-
-  startResolve();
 }
+
+void LogicalDnsCluster::startPreInit() { startResolve(); }
 
 LogicalDnsCluster::~LogicalDnsCluster() {
   if (active_dns_query_) {
@@ -110,28 +107,29 @@ void LogicalDnsCluster::startResolve() {
                   new LogicalHost(info_, hostname_, Network::Utility::getIpv6AnyAddress(), *this));
               break;
             }
-            HostVectorSharedPtr new_hosts(new std::vector<HostSharedPtr>());
+            HostVectorSharedPtr new_hosts(new HostVector());
             new_hosts->emplace_back(logical_host_);
-            updateHosts(new_hosts, createHealthyHostList(*new_hosts), empty_host_lists_,
-                        empty_host_lists_, *new_hosts, {});
+            // Given the current config, only EDS clusters support multiple priorities.
+            ASSERT(priority_set_.hostSetsPerPriority().size() == 1);
+            auto& first_host_set = priority_set_.getOrCreateHostSet(0);
+            first_host_set.updateHosts(new_hosts, createHealthyHostList(*new_hosts),
+                                       HostsPerLocalityImpl::empty(), HostsPerLocalityImpl::empty(),
+                                       *new_hosts, {});
           }
         }
 
-        if (initialize_callback_) {
-          initialize_callback_();
-          initialize_callback_ = nullptr;
-        }
-        initialized_ = true;
-
+        onPreInitComplete();
         resolve_timer_->enableTimer(dns_refresh_rate_ms_);
       });
 }
 
-Upstream::Host::CreateConnectionData
-LogicalDnsCluster::LogicalHost::createConnection(Event::Dispatcher& dispatcher) const {
+Upstream::Host::CreateConnectionData LogicalDnsCluster::LogicalHost::createConnection(
+    Event::Dispatcher& dispatcher,
+    const Network::ConnectionSocket::OptionsSharedPtr& options) const {
   PerThreadCurrentHostData& data = parent_.tls_->getTyped<PerThreadCurrentHostData>();
   ASSERT(data.current_resolved_address_);
-  return {HostImpl::createConnection(dispatcher, *parent_.info_, data.current_resolved_address_),
+  return {HostImpl::createConnection(dispatcher, *parent_.info_, data.current_resolved_address_,
+                                     options),
           HostDescriptionConstSharedPtr{
               new RealHostDescription(data.current_resolved_address_, shared_from_this())}};
 }

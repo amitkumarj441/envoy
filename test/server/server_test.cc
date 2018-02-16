@@ -11,7 +11,9 @@
 
 #include "gtest/gtest.h"
 
+using testing::HasSubstr;
 using testing::InSequence;
+using testing::Property;
 using testing::SaveArg;
 using testing::StrictMock;
 using testing::_;
@@ -27,8 +29,8 @@ TEST(ServerInstanceUtil, flushHelper) {
   store.gauge("world").set(5);
   std::unique_ptr<Stats::MockSink> sink(new StrictMock<Stats::MockSink>());
   EXPECT_CALL(*sink, beginFlush());
-  EXPECT_CALL(*sink, flushCounter("hello", 1));
-  EXPECT_CALL(*sink, flushGauge("world", 5));
+  EXPECT_CALL(*sink, flushCounter(Property(&Stats::Metric::name, "hello"), 1));
+  EXPECT_CALL(*sink, flushGauge(Property(&Stats::Metric::name, "world"), 5));
   EXPECT_CALL(*sink, endFlush());
 
   std::list<Stats::SinkPtr> sinks;
@@ -105,12 +107,6 @@ protected:
     EXPECT_TRUE(server_->api().fileExists("/dev/null"));
   }
 
-  void TearDown() override {
-    server_->threadLocal().shutdownGlobalThreading();
-    server_->clusterManager().shutdown();
-    server_->threadLocal().shutdownThread();
-  }
-
   Network::Address::IpVersion version_;
   testing::NiceMock<MockOptions> options_;
   DefaultTestHooks hooks_;
@@ -124,6 +120,25 @@ protected:
 
 INSTANTIATE_TEST_CASE_P(IpVersions, ServerInstanceImplTest,
                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()));
+
+TEST_P(ServerInstanceImplTest, V2ConfigOnly) {
+  options_.service_cluster_name_ = "some_cluster_name";
+  options_.service_node_name_ = "some_node_name";
+  options_.v2_config_only_ = true;
+  try {
+    initialize(std::string());
+    FAIL();
+  } catch (const EnvoyException& e) {
+    EXPECT_THAT(e.what(), HasSubstr("Unable to parse JSON as proto"));
+  }
+}
+
+TEST_P(ServerInstanceImplTest, V1ConfigFallback) {
+  options_.service_cluster_name_ = "some_cluster_name";
+  options_.service_node_name_ = "some_node_name";
+  options_.v2_config_only_ = false;
+  initialize(std::string());
+}
 
 TEST_P(ServerInstanceImplTest, Stats) {
   options_.service_cluster_name_ = "some_cluster_name";
@@ -155,5 +170,60 @@ TEST_P(ServerInstanceImplTest, BootstrapNodeWithOptionsOverride) {
   EXPECT_EQ(VersionInfo::version(), server_->localInfo().node().build_version());
 }
 
+// Negative test for protoc-gen-validate constraints.
+TEST_P(ServerInstanceImplTest, ValidateFail) {
+  options_.service_cluster_name_ = "some_cluster_name";
+  options_.service_node_name_ = "some_node_name";
+  options_.v2_config_only_ = true;
+  try {
+    initialize("test/server/empty_bootstrap.yaml");
+    FAIL();
+  } catch (const EnvoyException& e) {
+    EXPECT_THAT(e.what(), HasSubstr("Proto constraint validation failed"));
+  }
+}
+
+TEST_P(ServerInstanceImplTest, LogToFile) {
+  const std::string path =
+      TestEnvironment::temporaryPath("ServerInstanceImplTest_LogToFile_Test.log");
+  options_.log_path_ = path;
+  options_.service_cluster_name_ = "some_cluster_name";
+  options_.service_node_name_ = "some_node_name";
+  initialize(std::string());
+  EXPECT_TRUE(server_->api().fileExists(path));
+
+  GET_MISC_LOGGER().set_level(spdlog::level::info);
+  ENVOY_LOG_MISC(warn, "LogToFile test string");
+  Logger::Registry::getSink()->flush();
+  std::string log = server_->api().fileReadToEnd(path);
+  EXPECT_GT(log.size(), 0);
+  EXPECT_TRUE(log.find("LogToFile test string") != std::string::npos);
+
+  // Test that critical messages get immediately flushed
+  ENVOY_LOG_MISC(critical, "LogToFile second test string");
+  log = server_->api().fileReadToEnd(path);
+  EXPECT_TRUE(log.find("LogToFile second test string") != std::string::npos);
+}
+
+TEST_P(ServerInstanceImplTest, LogToFileError) {
+  options_.log_path_ = "/this/path/does/not/exist";
+  options_.service_cluster_name_ = "some_cluster_name";
+  options_.service_node_name_ = "some_node_name";
+  try {
+    initialize(std::string());
+    FAIL();
+  } catch (const EnvoyException& e) {
+    EXPECT_THAT(e.what(), HasSubstr("Failed to open log-file"));
+  }
+}
+
+TEST_P(ServerInstanceImplTest, NoOptionsPassed) {
+  EXPECT_THROW_WITH_MESSAGE(
+      server_.reset(new InstanceImpl(
+          options_,
+          Network::Address::InstanceConstSharedPtr(new Network::Address::Ipv4Instance("127.0.0.1")),
+          hooks_, restart_, stats_store_, fakelock_, component_factory_, thread_local_)),
+      EnvoyException, "unable to read file: ")
+}
 } // namespace Server
 } // namespace Envoy

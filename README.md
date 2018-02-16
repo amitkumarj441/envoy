@@ -1,6 +1,6 @@
 ![Envoy Logo](https://github.com/envoyproxy/artwork/blob/master/PNG/Envoy_Logo_Final_PANTONE.png)
 
-[C++ L7 proxy and communication bus](https://envoyproxy.github.io/)
+[C++ L7 proxy and communication bus](https://www.envoyproxy.io/)
 
 Envoy is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNCF). If you are a company that wants to help shape the evolution of technologies that are container-packaged, dynamically-scheduled and microservices-oriented, consider joining the CNCF. For details about who's involved and how Envoy plays a role, read the CNCF [announcement](https://www.cncf.io/blog/2017/09/13/cncf-hosts-envoy/).
 
@@ -9,14 +9,17 @@ Envoy is hosted by the [Cloud Native Computing Foundation](https://cncf.io) (CNC
 
 ## Documentation
 
-* [Offical documentation](https://envoyproxy.github.io).
+* [Official documentation](https://www.envoyproxy.io/)
+* [FAQ](https://www.envoyproxy.io/docs/envoy/latest/faq/overview)
+* [Unofficial Chinese documentation](https://github.com/lixiangyun/envoyproxy_doc_ZH_CN)
 * Watch [a video overview of Envoy](https://www.youtube.com/watch?v=RVZX4CwKhGE)
 ([transcript](https://www.microservices.com/talks/lyfts-envoy-monolith-service-mesh-matt-klein/))
-to find out more about the origin story and design philosophy of Envoy.
-* [Blog](https://medium.com/@mattklein123/envoy-threading-model-a8d44b922310) about the threading model.
-* [Blog](https://medium.com/@mattklein123/envoy-hot-restart-1d16b14555b5) about hot restart.
-* [Blog](https://medium.com/@mattklein123/envoy-stats-b65c7f363342) about stats architecture.
-* [Blog](https://medium.com/@mattklein123/the-universal-data-plane-api-d15cec7a) about universal data plane API.
+to find out more about the origin story and design philosophy of Envoy
+* [Blog](https://medium.com/@mattklein123/envoy-threading-model-a8d44b922310) about the threading model
+* [Blog](https://medium.com/@mattklein123/envoy-hot-restart-1d16b14555b5) about hot restart
+* [Blog](https://medium.com/@mattklein123/envoy-stats-b65c7f363342) about stats architecture
+* [Blog](https://medium.com/@mattklein123/the-universal-data-plane-api-d15cec7a) about universal data plane API
+* [Blog](https://medium.com/@mattklein123/lyfts-envoy-dashboards-5c91738816b1) on Lyft's Envoy dashboards
 
 ## Related
 
@@ -34,20 +37,39 @@ to find out more about the origin story and design philosophy of Envoy.
   feature design, etc.).
 * [envoy-maintainers](https://groups.google.com/forum/#!forum/envoy-maintainers): Use this list
   to reach all core Envoy maintainers.
-* [#lyft-envoy](http://webchat.freenode.net/?channels=lyft-envoy): IRC (synced to Gitter).
 * [Twitter](https://twitter.com/EnvoyProxy/): Follow along on Twitter!
-* [lyft/envoy](https://gitter.im/lyft/envoy): Gitter (most people use Gitter. NOTE: Response to user
-  questions is best effort on Gitter. For a "guaranteed" response please email envoy-users@ per the
-  guidance in the following linked thread.).
+* [Slack](https://envoyproxy.slack.com/): Slack, to get invited go [here](http://envoyslack.cncf.io).
+  We have the IRC/XMPP gateways enabled if you prefer either of those. Once an account is created,
+  connection instructions for IRC/XMPP can be found [here](https://envoyproxy.slack.com/account/gateways).
+  * NOTE: Response to user questions is best effort on Slack. For a "guaranteed" response please email
+    envoy-users@ per the guidance in the following linked thread.
 
-Please see [this](https://groups.google.com/forum/#!topic/envoy-announce/l9zjYsnS3TY) email thread 
+Please see [this](https://groups.google.com/forum/#!topic/envoy-announce/l9zjYsnS3TY) email thread
 for information on email list usage.
+
+## Contributing
+
+Contributing to Envoy is fun and modern C++ is a lot less scary than you might think if you don't
+have prior experience. To get started:
+
+* [Contributing guide](CONTRIBUTING.md)
+* [Beginner issues](https://github.com/envoyproxy/envoy/issues?q=is%3Aopen+is%3Aissue+label%3Abeginner)
+* [Build/test quick start using docker](ci#building-and-running-tests-as-a-developer)
+* [Developer guide](DEVELOPER.md)
+* Consider installing the Envoy [development support toolchain](https://github.com/envoyproxy/envoy/blob/master/support/README.md), which helps automate parts of the development process, particularly those involving code review.
+* Please make sure that you let us know if you are working on an issue so we don't duplicate work!
+
+## Community Meeting
+
+The Envoy team meets every other Tuesday at 9am PT. The public Google calendar is here: https://goo.gl/PkDijT
+
+Meeting minutes are here: https://goo.gl/5Cergb
 
 ## Reporting security vulnerabilities
 
-If you've found a vulnerability or a potential vulnerability in Envoy
-please let us know at envoy-security@googlegroups.com. We'll send a
-confirmation email to acknowledge your report, and we'll send an
-additional email when we've identified the issue positively or negatively.
+If you've found a vulnerability or a potential vulnerability in Envoy please let us know at
+[envoy-security](https://groups.google.com/forum/#!forum/envoy-security). We'll send a confirmation
+email to acknowledge your report, and we'll send an additional email when we've identified the issue
+positively or negatively.
 
-
+For further details please see our complete [security release process](SECURITY_RELEASE_PROCESS.md).
